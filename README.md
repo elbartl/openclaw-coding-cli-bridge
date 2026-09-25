@@ -1,4 +1,159 @@
-# openclaw-antigravity-proxy
+# openclaw-coding-cli-bridge
+
+Zero-dependency Node.js bridges that expose agentic **coding CLIs** as an
+**OpenAI-compatible API**, so [OpenClaw](https://openclaw.ai) — or any other
+OpenAI-API client — can use them as model backends with your existing CLI login:
+
+| Backend | File | Port | CLI |
+|---|---|---|---|
+| Claude Code | `claude_proxy.js` | 8001 | `claude -p --output-format stream-json` |
+| Google Antigravity | `proxy.js` | 8000 | `agy --print` |
+
+Both share one client contract: model ids with a `-ro` suffix select a read-only
+permission role, a concurrency semaphore with a bounded queue protects small hosts,
+visible `⏳` progress ticks keep OpenClaw's stall detector (~400 s) fed during long
+agent runs, every failure is reported as an SSE `error` event (never as content that
+looks like a successful answer), and exact-match control replies (`NO_REPLY`,
+`HEARTBEAT_OK`, …) are passed through byte-for-byte.
+
+The CLIs run locally under your own account through their official entry points —
+no OAuth tokens are extracted or shared. Usage counts against your own plan/limits.
+
+## Claude Code backend (`claude_proxy.js`)
+
+```
+OpenClaw gateway
+      │  POST /v1/chat/completions
+      ▼
+claude_proxy.js (127.0.0.1:8001)
+      │  spawn per request (cwd = neutral workdir or a named project):
+      │  claude -p --output-format stream-json --verbose --include-partial-messages
+      │         --no-session-persistence --model X [--effort Y]
+      │         --append-system-prompt-file <system msgs> --mcp-config <file>
+      │         <role flags>                     (prompt on stdin)
+      ▼
+Claude Code agent loop: built-in tools + MCP servers (Home Assistant, …)
+```
+
+Simpler than the agy bridge because Claude Code streams **structured events**: every
+model turn, tool call, tool result, rate-limit state and the final `result` (with
+`is_error` and `permission_denials`) is a stdout line. No log tailing or `/proc`
+sampling is needed.
+
+### Model ids
+
+`<model>[:<project>][-ro]`
+
+| Id | Runs |
+|---|---|
+| `claude-sonnet`, `claude-opus`, `claude-haiku`, `claude-fable` | latest model of that family |
+| `claude-opus-high` | `claude-opus-5-5 --effort high` |
+| `claude-code` | `CC_MODEL` (default `sonnet`) |
+| `claude-<full-id>` | that exact model, e.g. `claude-sonnet-5` |
+| `…:ha` | inside project `ha` (see below) |
+| `…-ro` | read-only role |
+
+`@` is deliberately not used: OpenClaw parses `model@profile` as an auth-profile selector.
+
+### Roles
+
+- **full** — `--dangerously-skip-permissions`.
+- **ro** — `--permission-mode dontAsk` (anything not allowed is denied at once, no
+  hang), built-in tools narrowed with `--tools` (default `Read,Glob,Grep,WebSearch,WebFetch`;
+  without it, Bash commands Claude Code classifies as read-only are still auto-approved),
+  an allowlist from `ro-allow.json`, and deny rules for secrets
+  (`secrets.yaml`, `.env*`, `*.pem`, `*.key`, `.ssh/`) plus per-project `roDeny`.
+  A `Read` deny also hides the file from `Grep`/`Glob`. Denials are logged and appended
+  as a visible `⚠️ [proxy]` note.
+
+User settings are never loaded (`--setting-sources ""`), so personal hooks, plugins and
+permission rules stay out of bridge runs. In the ro role project settings are not
+loaded either — a project's own allowlist would silently widen the role.
+
+### Projects
+
+`~/.config/openclaw-claude/projects.json`:
+
+```json
+{ "ha": { "dir": "/home/me/projects/homeassistant",
+          "roDeny": ["Read(//home/me/projects/homeassistant/config/secrets.yaml)"] } }
+```
+
+`claude-sonnet:ha` starts in that directory, so Claude Code loads the project's
+`CLAUDE.md` (in both roles) and, in the full role, its `.claude/settings*.json`.
+
+### Delegating to OpenClaw agents (`mcp/openclaw-agents.js`)
+
+Both bridges ignore the OpenAI `tools` field, so a main agent served through them can't
+call OpenClaw's `sessions_spawn`. The bundled MCP server gives it an `ask_agent` tool
+instead: one synchronous turn via
+`openclaw agent --agent <id> --session-key agent:<id>:cc-<uuid> --json`. The subagent
+keeps its own model and permissions from `openclaw.json`. Agents and their descriptions
+come from `OPENCLAW_AGENTS` (JSON). While a tool call is open the idle timeout is
+suspended; only the hard limit applies.
+
+### Setup
+
+```bash
+tools/build-claude-profile.py
+# → ~/.config/openclaw-claude/mcp.json       (from agy's mcp_config.json + openclaw_agents)
+#   ~/.config/openclaw-claude/ro-allow.json  (from the agy RO profile: mcp(s/t) → mcp__s__t)
+#   ~/.config/openclaw-claude/projects.json  (created empty once)
+node claude_proxy.js
+curl -s localhost:8001/healthz
+```
+
+These files live outside the repo on purpose — MCP configs carry private URLs/tokens.
+
+systemd user unit (`~/.config/systemd/user/openclaw-claude-proxy.service`):
+
+```ini
+[Service]
+ExecStart=/usr/bin/node %h/projects/openclaw/claude_proxy.js
+Restart=always
+KillMode=control-group
+Environment=PATH=%h/.local/bin:/usr/bin:/usr/local/bin:/bin
+Environment=CC_PROXY_PORT=8001
+Environment=CC_MAX_CONCURRENT=2
+Environment=CC_MAX_QUEUE=4
+[Install]
+WantedBy=default.target
+```
+
+OpenClaw provider (`models.providers` in `openclaw.json`; also list each
+`cc/<id>` in `agents.defaults.models` **without** an alias, and in `modelPolicy.allow`):
+
+```json
+"cc": {
+  "baseUrl": "http://127.0.0.1:8001",
+  "api": "openai-completions",
+  "apiKey": "cc-local-proxy",
+  "models": [{ "id": "claude-opus-high", "name": "Claude Opus (high effort)",
+               "contextWindow": 200000, "maxTokens": 8192, "input": ["text"],
+               "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+               "reasoning": false }]
+}
+```
+
+### Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CC_PROXY_PORT` | `8001` | Listen port (127.0.0.1). |
+| `CC_MODEL` / `CC_EFFORT` | `sonnet` / unset | Default model / effort. |
+| `CC_MAX_CONCURRENT`, `CC_MAX_QUEUE`, `CC_QUEUE_TIMEOUT_MS` | 2, 4, 10 min | Semaphore. |
+| `CC_IDLE_MS`, `CC_HARD_MS` | 15 min, 30 min | No-event timeout / absolute limit. |
+| `CC_WORKDIR` | `~/.openclaw-claude/work` | cwd when no project is selected (readable in ro — keep it clean). |
+| `CC_CONFIG_DIR` | `~/.config/openclaw-claude` | `mcp.json`, `ro-allow.json`, `projects.json`. |
+| `CC_RO_TOOLS` | `Read,Glob,Grep,WebSearch,WebFetch` | Built-in tools in the ro role. |
+| `CC_DEFAULT_ROLE` | `full` | Role for ids without `-ro`. |
+| `CC_PROXY_DEBUG` | unset | Dump dir for the last system prompt / prompt / stderr. |
+
+A rejected subscription window (`rate_limit_event` with `status: rejected`) kills the run
+at once and returns `quota_exhausted` with the reset time, so OpenClaw can fall back to
+another model instead of waiting.
+
+## Antigravity backend (`proxy.js`)
 
 A tiny, zero-dependency Node.js proxy that exposes Google **Antigravity** (the `agy` CLI)
 as an **OpenAI-compatible API**, so that [OpenClaw](https://openclaw.ai) — or any other
@@ -24,7 +179,7 @@ translation itself but the production hardening around a CLI that was never desi
 be a server backend: adaptive timeouts, live progress reporting, error mining from log
 files, process-tree cleanup, and per-request model routing.
 
-## Why
+### Why
 
 `agy` is a fully agentic CLI: given a single prompt it will happily run web searches,
 shell commands and multi-step investigations that take **minutes** and print *nothing*
@@ -32,7 +187,7 @@ until the very end. Wrapping that in a chat API that streams, times out sanely, 
 transient failures and reports progress requires solving a few non-obvious problems —
 documented below and in the comments throughout `proxy.js`.
 
-## Features
+### Features
 
 - **OpenAI-compatible endpoints**: `POST /v1/chat/completions` (stream and non-stream),
   `GET /v1/models`.
@@ -62,13 +217,13 @@ documented below and in the comments throughout `proxy.js`.
 - **Telemetry** — every request logs prompt size, model routing, TTFT, total time,
   exit code and the number of agent-loop rounds.
 
-## Requirements
+### Requirements
 
 - Node.js ≥ 18 (any version with `node:http`; no npm packages needed)
 - [Antigravity CLI](https://antigravity.google) (`agy`) installed and authenticated
 - Linux (uses process groups and `systemd --user`; adaptable elsewhere)
 
-## Quick start
+### Quick start
 
 ```bash
 node proxy.js
@@ -81,7 +236,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"gemini-flash","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-## Running as a systemd user service
+### Running as a systemd user service
 
 Create `~/.config/systemd/user/openclaw-proxy.service`:
 
@@ -124,7 +279,7 @@ loginctl enable-linger $USER                   # start at boot without login
 Restart the service after **any** edit to `proxy.js` — and don't run `node proxy.js`
 manually while the service is up (port conflict, `EADDRINUSE`).
 
-## Configuration
+### Configuration
 
 All knobs are constants at the top of `proxy.js`:
 
@@ -141,7 +296,7 @@ All knobs are constants at the top of `proxy.js`:
 | `AGY_MODEL` (env) | unset | Default `agy` model when the request doesn't pick one. |
 | `AGY_PROXY_DEBUG` (env) | unset | Directory for `last_prompt.txt` / `last_stderr.txt` dumps. |
 
-## OpenClaw integration notes
+### OpenClaw integration notes
 
 Two gotchas that cost real debugging time:
 
@@ -153,7 +308,7 @@ Two gotchas that cost real debugging time:
    Each model must also appear in **both** `models.providers.agy.models[]` *and* the
    `agents.defaults.models` allowlist.
 
-## Known limitations
+### Known limitations
 
 - No concurrency limit — each parallel request is a heavy `agy` process; on small
   hosts (Raspberry Pi) many simultaneous agentic tasks can exhaust RAM.
@@ -165,11 +320,15 @@ Two gotchas that cost real debugging time:
   `--print` consumes the prompt). If behavior changes overnight, check `agy --version`
   and the binary's mtime first.
 
-## Repository layout
+### Files
 
 | File | What it is |
 |---|---|
-| `proxy.js` | The proxy. The only file you need. |
+| `proxy.js` | The Antigravity bridge. |
+| `claude_proxy.js` | The Claude Code bridge. |
+| `mcp/openclaw-agents.js` | MCP server: `ask_agent` → OpenClaw subagents. |
+| `tools/build-claude-profile.py` | Builds the Claude Code bridge config from the agy profile. |
+| `tools/build-ro-profile.sh` | Builds the agy read-only profile. |
 | `antigravity_proxy.py` | Abandoned first prototype (FastAPI + hypothetical SDK). Kept for history; not used. |
 | `requirements.txt` | Belongs to the abandoned prototype. |
 
