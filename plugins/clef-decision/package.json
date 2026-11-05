@@ -1,0 +1,10 @@
+{
+  "name": "@local/openclaw-clef-decision",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw decision provider for Cloudflare Workers AI CLEF (clef, clef-flash).",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

@@ -26,7 +26,7 @@ RO_TOOLS=(
   ha_get_state ha_get_entity ha_get_device ha_get_history ha_get_overview
   ha_search ha_list_services ha_list_floors_areas ha_get_integration
   ha_get_addon ha_get_hacs_info ha_get_blueprint ha_get_camera_image
-  ha_get_operation_status ha_eval_template
+  ha_get_operation_status ha_get_system_health ha_eval_template
   # Needed by the ha_watchdog_v2 checklist in AGENTS.md — and only reached when
   # something is already wrong, so a missing rule here would fail the watchdog
   # exactly during an incident. A denied tool aborts the WHOLE headless run
@@ -58,8 +58,15 @@ RO_COMMANDS=()
 # separate from `mcp` and `command` (discovered 2026-08-06 by probing: with no
 # read_file rule, agy refuses to read ANY path — including inside
 # trustedWorkspaces). Keep this list to exact files the RO role genuinely needs.
-# ha_watchdog_v2 needs AGENTS.md as its source of truth; nothing else so far.
+# ha_watchdog_v2 + ha_watchdog_hygiene read WATCHDOG.md (checklist + the
+# "deliberately disabled" list). Split out of AGENTS.md on 2026-08-10: the
+# watchdog was reading ~21k tokens of full briefing 24x/day to execute a ~8k
+# checklist. AGENTS.md stays readable for the roster (ha-diag) during diagnosis.
+# ./WATCHDOG.md avoids OpenClaw 2026.10.4 AWS_SECRET_ACCESS_KEY_MATCHER false
+# positive on the 40-char base64-alphabet substring "/home/bl/projects/homeassistant/WATCHDOG".
 RO_READ_FILES=(
+  "$WORKSPACE/WATCHDOG.md"
+  "$WORKSPACE/./WATCHDOG.md"
   "$WORKSPACE/AGENTS.md"
 )
 

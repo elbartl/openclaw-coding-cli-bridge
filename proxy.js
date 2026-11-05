@@ -2,7 +2,39 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
+const { parseAgyModels, resolveAll } = require('./model_resolver');
+const { StringDecoder } = require('string_decoder');
+const { applyPaperclipWake, ENV_KEYS: PC_ENV_KEYS } = require('./tools/paperclip_wake');
+const { createWriter: createPoolWriter, agyPoolFor } = require('./tools/pools_state');
+const { quotaMessage } = require('./tools/quota_error');
+const { createAgyStreamParser } = require('./tools/agy_stream');
+// stream-json gives token usage (context ring in OpenClaw). AGY_STREAM_JSON=0
+// falls back to plain text mode without a code revert.
+const AGY_STREAM_JSON = process.env.AGY_STREAM_JSON !== '0';
+// agy keeps a per-conversation SQLite trajectory (one row per turn / tool call)
+// and appends to it LIVE during a run — verified 2026-09-11 by polling it while
+// agy worked. That table is the only progress signal that sees sub-second tool
+// calls, which the /proc sampler structurally cannot (see readNewSteps).
+let DatabaseSync = null;
+try { ({ DatabaseSync } = require('node:sqlite')); } catch (e) { /* older node: step signal off, /proc only */ }
+
+let approvalsRef = null;
+function getApprovals() {
+    if (approvalsRef) return approvalsRef;
+    try { approvalsRef = require('./tools/paperclip_approvals.js'); } catch (e) { approvalsRef = null; }
+    return approvalsRef;
+}
+function _setApprovals(a) { approvalsRef = a; }
+
+let devWorkspaceRef = null;
+function getDevWorkspace() {
+    if (devWorkspaceRef) return devWorkspaceRef;
+    try { devWorkspaceRef = require('./tools/dev_workspace.js'); } catch (e) { devWorkspaceRef = null; }
+    return devWorkspaceRef;
+}
+function _setDevWorkspace(w) { devWorkspaceRef = w; }
+const DEV_ENV_KEYS = ['DEV_WORKTREE_ROOT', 'DEV_ISSUE_KEY'];
 
 const PORT = parseInt(process.env.PROXY_PORT || '8000', 10);
 // agy print mode may run web searches and tools for complex queries, which
@@ -35,7 +67,9 @@ const PORT = parseInt(process.env.PROXY_PORT || '8000', 10);
 // HARD stays the authoritative ceiling for a genuinely runaway/stuck process.
 const SOFT_TIMEOUT_MS = 720000;     // 12 min — extend past this only if agy is active
 const IDLE_TIMEOUT_MS = 900000;     // 15 min with no round, no stdout AND no live tool subprocess — long enough for one slow Pro round
-const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
+// Was 30 min and killed healthy long runs mid-work (29.10). IDLE/STUCK end dead
+// runs; HARD is only the runaway ceiling now.
+const HARD_TIMEOUT_MS = parseInt(process.env.AGY_HARD_MS || '10800000', 10); // 3 h — absolute kill (authoritative)
 // Loop guard: a model round resets the idle clock (it IS activity), so an agy
 // spinning rounds fast — e.g. asked for something it has no tool/permission for
 // — never trips IDLE and rides HARD to the full 30 min (then OpenClaw re-runs
@@ -43,7 +77,26 @@ const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
 // tokens, and no live tool subprocess = looping without progress. A single slow
 // round can't trip it (needs several rounds); a legit long tool run can't
 // (hasActiveToolChild is true, and a blocked-on-tool agy emits no new rounds).
-const STUCK_NO_OUTPUT_MS = 420000;  // 7 min of rounds-but-no-stdout-and-no-tool => stuck, kill fast
+// NOTE this is a budget on TIME-TO-FIRST-TOKEN (total since attempt start), not
+// a stall timer — a fast-spinning loop keeps emitting rounds, so "no new round"
+// would never fire and only elapsed time discriminates. That makes the value a
+// straight bet on how long a healthy tool-heavy run may stay silent.
+// Raised 7 -> 12 min on 2026-08-07 after measuring the real workload: the
+// ha_watchdog_v2 cron normally answers in 30-90s, but two consecutive runs
+// during a live incident needed far longer (12:00 finished OK at TTFT=394s,
+// 51 rounds — 26s under the old 420s wire; 11:00 was killed at 420s with 28
+// rounds and produced nothing). The watchdog gets slowest exactly when
+// something is wrong, so a tight budget cuts hardest during an incident.
+// Round RATE does not separate the two cases (the healthy run span rounds
+// FASTER: 7.8/min vs 4/min), so raising the ceiling is the only honest fix.
+// Still well under HARD (30 min), and the permission-denial loop that
+// originally motivated STUCK now exits on its own via the glog signature,
+// so it no longer depends on this timer.
+// Explicitly set by the operator, or null. Kept separate from the effective
+// value because a per-model override must not silently defeat it (see
+// timeoutsFor): AGY_STUCK_MS=40000 used to be ignored for every Flash model.
+const ENV_STUCK_MS = process.env.AGY_STUCK_MS ? Number(process.env.AGY_STUCK_MS) : null;
+const STUCK_NO_OUTPUT_MS = ENV_STUCK_MS || 720000;
 const STUCK_MIN_ROUNDS = 3;         // require several rounds so one slow first round isn't mistaken for a loop
 // A live tool subprocess keeps the run alive (see hasActiveToolChild), but ONLY
 // for this long past the last real progress (model round or stdout). Without a
@@ -51,11 +104,20 @@ const STUCK_MIN_ROUNDS = 3;         // require several rounds so one slow first 
 // counts as "active tool" indefinitely and rides HARD to 30 min. Past the grace,
 // a lingering child no longer masks the idle/stuck detectors.
 const TOOL_GRACE_MS = 600000;       // 10 min of tool-only activity past last real round/stdout
-const AGY_PRINT_TIMEOUT = '35m';    // agy's own budget, kept above HARD
+// agy 1.4.0 (2026-10-16) sometimes never exits after the conversation is over:
+// the glog logs "CLI store manager shutting down" + "Stopping conversation
+// stream", the answer is already on stdout, but the process sits in futex_wait
+// holding the MCP servers' stdin open (mcp-nextcloud-rag stays alive). Nothing
+// moves after that, so the run rode IDLE (20 min) and was then reported as a
+// failure — OpenClaw re-ran a turn that had in fact finished. Once the shutdown
+// line is seen, agy gets this long to exit on its own before we reap the group
+// and finish the run with the exit code a clean exit would have had (0).
+const EXIT_GRACE_MS = 15000;
+const AGY_PRINT_TIMEOUT = `${Math.ceil(HARD_TIMEOUT_MS / 60000) + 5}m`; // agy's own budget, kept above HARD
 const WATCHDOG_MS = 15000;          // adaptive-timeout check cadence
 const LOG_POLL_MS = 2000;           // how often the agy log file is tailed
 const HEARTBEAT_MS = 15000;         // visible progress-tick cadence during silence
-const STATUS_MIN_GAP_MS = 60000;    // min spacing of visible round-update status lines (append-only UI)
+const STATUS_MIN_GAP_MS = parseInt(process.env.AGY_STATUS_GAP_MS || '60000', 10); // min spacing of visible status lines (append-only UI); env-tunable so the rationing can be exercised in tests
 const PROGRESS_MAX_GAP_MS = 180000; // max spacing of ANY visible tick — kept under OpenClaw's ~400s stall/abort so a silent long tool never looks stalled to the client
 const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy failure
 // On ANY error termination (timeout, spawn error, non-zero exit, empty output,
@@ -65,6 +127,89 @@ const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy fa
 // agy-fail-. Saved glogs older than this are swept on startup so /tmp can't grow
 // without bound.
 const GLOG_RETENTION_DAYS = parseInt(process.env.AGY_GLOG_RETENTION_DAYS || '7', 10);
+
+// agy retries a RESOURCE_EXHAUSTED (429) quota error internally, on its own
+// growing backoff (seen: 4s, 8s, 14s, ... up to ~3.5min between attempts,
+// 8 attempts before it gives up) — for a genuinely exhausted quota (reset
+// hours away) that whole loop is pointless and ties up a concurrency slot
+// for 15-25 min, starving the queue for every other request (observed
+// 2026-09-10: agy/claude-opus quota exhausted with ~3h reset, four separate
+// runs each held a slot 20-25 min, so a third request queued behind them hit
+// QUEUE_TIMEOUT_MS and died with "Przekroczono limit oczekiwania w
+// kolejce"). agy has no --no-retry flag, so the fix lives here: the glog
+// carries the quota line (with the reset ETA) the moment the FIRST attempt
+// fails, well before agy's own loop gives up — watchAgyLog surfaces it live
+// so runAgy can kill the child immediately instead of waiting agy out.
+// A reset far enough out that waiting can't help gets killed right away;
+// a reset within this window is left to agy's own short backoff (may still
+// succeed on the next attempt).
+const QUOTA_FAIL_FAST_MS = parseInt(process.env.AGY_QUOTA_FAIL_FAST_MS || '90000', 10);
+
+// How long a conversation step keeps counting as "agy is making progress".
+// A new row in agy's trajectory table (a model turn or a tool call) is hard
+// evidence of work, unlike the /proc scan which only catches a tool child that
+// happens to be in R/D at sample time. Measured failure this fixes (2026-09-10
+// 23:07): a run with 48 successful `run_command` steps was killed as STUCK
+// because every command finished well inside the 15s watchdog gap, so the
+// sampler saw an idle tree and "no output for 12 min" looked like a loop.
+const STEP_PROGRESS_WINDOW_MS = parseInt(process.env.AGY_STEP_WINDOW_MS || '120000', 10);
+const QUOTA_RESET_RE = /RESOURCE_EXHAUSTED.*?Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/;
+
+// Parse agy's glog "RESOURCE_EXHAUSTED ... Resets in 2h55m31s" line. Returns
+// the reset delay in ms, or null if the line isn't a quota-exhaustion line.
+function matchQuotaReset(line) {
+    const m = line.match(QUOTA_RESET_RE);
+    if (!m) return null;
+    const h = parseInt(m[1] || 0, 10), mi = parseInt(m[2] || 0, 10), se = parseInt(m[3] || 0, 10);
+    return (h * 3600 + mi * 60 + se) * 1000;
+}
+
+// Human-readable reset ETA for user-facing messages ("2h 55m" / "45s").
+function fmtDuration(ms) {
+    if (ms == null) return 'nieznany czas';
+    const totalSec = Math.round(ms / 1000);
+    const h = Math.floor(totalSec / 3600), m = Math.floor((totalSec % 3600) / 60), s = totalSec % 60;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+// Ring buffer of recent console output, so /logs gives a live-ish debug view
+// from a browser without an SSH session + journalctl on the Pi.
+const LOG_BUFFER_MAX = parseInt(process.env.AGY_LOG_BUFFER_LINES || '400', 10);
+const logBuffer = [];
+function captureLog(args) {
+    try {
+        const text = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+        // The request logger already stamps its own line; don't double it.
+        const line = /^\[\d{4}-\d{2}-\d{2}T/.test(text) ? text : `[${new Date().toISOString()}] ${text}`;
+        logBuffer.push(line);
+        if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
+    } catch (e) {}
+}
+const origConsoleLog = console.log.bind(console);
+const origConsoleError = console.error.bind(console);
+console.log = (...args) => { origConsoleLog(...args); captureLog(args); };
+console.error = (...args) => { origConsoleError(...args); captureLog(args); };
+
+// Per-model timeout overrides: keyed by a regex on the lowercased agy model
+// name (see MODEL_MAP) — family words, not versions, since names now move. Flat global timeouts used to fight
+// Pro-High-thinking (legitimately slow, needs headroom) against a runaway
+// Flash loop (should fail fast) — see the long comment block at the top of
+// this file. Only override what differs; anything unlisted falls through to
+// the global default.
+const MODEL_TIMEOUT_OVERRIDES = [
+    { match: /\b(pro|argon)\b/, soft: 900000, idle: 1200000 },              // Gemini Pro / Argon reasoning models — slow single rounds are normal, give more room
+    { match: /\bflash\b/, idle: 600000, stuck: 480000 },              // Flash: cheap/fast model, a stuck loop should die sooner
+];
+function timeoutsFor(agyModel) {
+    const base = { soft: SOFT_TIMEOUT_MS, idle: IDLE_TIMEOUT_MS, hard: HARD_TIMEOUT_MS, stuck: STUCK_NO_OUTPUT_MS };
+    const lower = (agyModel || '').toLowerCase();
+    const rule = agyModel ? MODEL_TIMEOUT_OVERRIDES.find(r => r.match.test(lower)) : null;
+    const t = rule ? { ...base, soft: rule.soft ?? base.soft, idle: rule.idle ?? base.idle, hard: rule.hard ?? base.hard, stuck: rule.stuck ?? base.stuck } : { ...base };
+    if (ENV_STUCK_MS) t.stuck = ENV_STUCK_MS;   // an explicit operator setting outranks the per-model default
+    return t;
+}
 
 // ---- Concurrency limiter -------------------------------------------------
 // Host is a Raspberry Pi; each agy spawn is hundreds of MB plus its own MCP
@@ -145,17 +290,22 @@ const sem = {
 // down turn after turn). Counts non-system, non-final messages.
 const HISTORY_LIMIT = 12;           // ~6 exchanges
 
-// Appended to the end of the system prompt. agy hosts the model on the
-// Antigravity backend; some models (seen with Claude Sonnet via agy) mistake
-// that host for their operating context and refuse to use the listed OpenClaw
-// tools — narrating "I'm in Antigravity context, let me use a schedule tool"
-// instead of just calling `cron`. This nails the identity so tool calls go
-// through. English on purpose: that's the language the model reasons in here.
+// Appended to the end of the system prompt. This proxy does NOT forward the
+// OpenAI `tools` array, so the OpenClaw tools named in the system prompt
+// (cron, message, sessions_*, ...) are never callable here; the model only has
+// agy's own tools plus the MCP servers in ~/.gemini/config/mcp_config.json
+// (`agy mcp list`). The note used to claim the opposite ("sessions_* and cron
+// ARE your tools"), which made the model promise work it could not do
+// (verified 2026-10-22). It also steers away from agy's built-in schedule /
+// subagent tools, which die with this one-shot process. English on purpose:
+// that's the language the model reasons in here.
 const IDENTITY_NOTE = [
     '## Identity & tools (authoritative — overrides any contrary assumption)',
-    'You ARE the OpenClaw assistant. The tools listed above (cron, read, write, exec, web_search, homeassistant__*, sessions_*, etc.) ARE your own tools — call them directly by name.',
-    'You run on a model backend (agy / Antigravity). That is only where the model is hosted; it does NOT change your operating context and does NOT limit which tools you can call.',
-    'There is no separate "Antigravity context", no "schedule tool", and no timer API. For any reminder, alarm, or scheduled wake-up, call the `cron` tool. Never narrate an inability to use OpenClaw tools — just call them.',
+    'You ARE the OpenClaw assistant; agy / Antigravity is only where the model is hosted.',
+    'OpenClaw tools named in the system prompt above (cron, message, sessions_spawn, sessions_*, subagents, etc.) are NOT callable in this backend. Never claim you called them and never promise follow-up work that depends on them.',
+    'Use only the tools you actually have: your own file/shell tools and your MCP tools (e.g. ha-mcp, nextcloud-rag, openclaw-agents, agy-history, gemini-web — whichever are present).',
+    'Delegating to an OpenClaw subagent (ha-diag, ha-log, ha-yaml): call the MCP tool `openclaw-agents/ask_agent` if you have it. Do NOT use agy\'s built-in invoke_subagent / define_subagent — they are not OpenClaw agents.',
+    'Reminders and scheduled work: agy\'s built-in `schedule` tool dies when this run ends, so never use it. If you have a shell, create an OpenClaw automation with `openclaw cron add ...` (see `openclaw cron add --help`); otherwise tell the user you cannot schedule it from here.',
 ].join('\n');
 
 // Optional debug dump dir: when AGY_PROXY_DEBUG is set, the full prompt and
@@ -168,20 +318,110 @@ const DEBUG_DIR = process.env.AGY_PROXY_DEBUG || null;
 const AGY_MODEL = process.env.AGY_MODEL || null;
 
 // Dynamic per-request model selection from OpenClaw.
-// Maps the OpenAI-style `model` id (what OpenClaw sends) -> exact `agy` model
-// name (as in `agy models`). To make these selectable in OpenClaw, add matching
-// model ids to the custom provider in ~/.openclaw/openclaw.json (see PROXY.md).
-// The id "antigravity" (current default) stays mapped to the AGY_MODEL default.
-const MODEL_MAP = {
-    "gemini-flash-low":  "Gemini 3.5 Flash (Low)",
-    "gemini-flash":      "Gemini 3.5 Flash (Medium)",
-    "gemini-flash-high": "Gemini 3.5 Flash (High)",
-    "gemini-pro-low":    "Gemini 3.1 Pro (Low)",
-    "gemini-pro":        "Gemini 3.1 Pro (High)",
-    "claude-sonnet":     "Claude Sonnet 4.6 (Thinking)",
-    "claude-opus":       "Claude Opus 4.6 (Thinking)",
-    "gpt-oss":           "GPT-OSS 120B (Medium)",
+// Maps the OpenAI-style `model` id (what OpenClaw sends) -> agy model name. To
+// make these selectable in OpenClaw, add matching model ids to the custom
+// provider in ~/.openclaw/openclaw.json (see PROXY.md). The id "antigravity"
+// (current default) stays mapped to the AGY_MODEL default.
+//
+// Since 2026-10-13 the names are NOT fixed: each id has a rule (family +
+// preferred tiers, optional fallback family) and is resolved against the live
+// `agy models` list by model_resolver.js — on start, every MODEL_REFRESH_MS,
+// and right before the in-proxy retry when agy rejects a model name. Policy:
+// only a model that VANISHED is replaced automatically; a newer version is just
+// reported in /healthz (`newer`). `seed` is the approved model — to upgrade,
+// change the seed and restart. The meta-watchdog reads /healthz and alarms on
+// any substitute/missing id or a failed refresh.
+const MODEL_RULES = {
+    "gemini-flash-low":  { seed: "Gemini 3.8 Flash (Low)",    family: 'gemini-flash', tiers: ['low'] },
+    "gemini-flash":      { seed: "Gemini 3.8 Flash (Medium)", family: 'gemini-flash', tiers: ['medium'] },
+    "gemini-flash-high": { seed: "Gemini 3.8 Flash (High)",   family: 'gemini-flash', tiers: ['high'] },
+    // 2026-10-13: agy dropped Gemini 3.1 Pro; the pro ids stand in on Flash and
+    // return to Pro by themselves once agy lists a Pro model again.
+    "gemini-pro-low":    { seed: "Gemini 3.8 Flash (Medium)", family: 'gemini-pro', tiers: ['low'],  fallback: { family: 'gemini-flash', tiers: ['medium'] } },
+    "gemini-pro":        { seed: "Gemini 3.8 Flash (High)",   family: 'gemini-pro', tiers: ['high'], fallback: { family: 'gemini-flash', tiers: ['high'] } },
+    // Gemini 4 Argon: frontier reasoning models (Low / Medium / High)
+    "gemini-argon-low":  { seed: "Gemini 4 Argon (Low)",    family: 'gemini-argon', tiers: ['low'] },
+    "gemini-argon":      { seed: "Gemini 4 Argon (Medium)", family: 'gemini-argon', tiers: ['medium'] },
+    "gemini-argon-high": { seed: "Gemini 4 Argon (High)",   family: 'gemini-argon', tiers: ['high'] },
+    // Tier names changed with 5.5 (Thinking -> Low/Medium/High): list both.
+    "claude-sonnet":     { seed: "Claude Sonnet 5.5 (High)",  family: 'claude-sonnet', tiers: ['high', 'thinking', 'medium'] },
+    "claude-opus":       { seed: "Claude Opus 5.5 (High)",    family: 'claude-opus',   tiers: ['high', 'thinking', 'medium'] },
+    // Lower Claude tiers agy also offers (added 2026-10-22).
+    "claude-sonnet-medium": { seed: "Claude Sonnet 5.5 (Medium)", family: 'claude-sonnet', tiers: ['medium'] },
+    "claude-sonnet-low":    { seed: "Claude Sonnet 5.5 (Low)",    family: 'claude-sonnet', tiers: ['low'] },
+    "claude-opus-medium":   { seed: "Claude Opus 5.5 (Medium)",   family: 'claude-opus',   tiers: ['medium'] },
+    "claude-opus-low":      { seed: "Claude Opus 5.5 (Low)",      family: 'claude-opus',   tiers: ['low'] },
+    "gpt-oss":           { seed: "GPT-OSS 120B (Medium)",     family: 'gpt-oss',       tiers: ['medium'] },
 };
+// Live id -> agy name. Starts at the seeds; refreshModels() rewrites it.
+const MODEL_MAP = Object.fromEntries(Object.entries(MODEL_RULES).map(([id, r]) => [id, r.seed]));
+const MODEL_REFRESH_MS = parseInt(process.env.AGY_MODEL_REFRESH_MS || '3600000', 10); // 1 h
+const MODEL_REFRESH_MIN_GAP_MS = 30000;   // a burst of "not recognized" retries shares one `agy models`
+const modelState = {
+    refreshedAt: null,        // ISO of the last SUCCESSFUL refresh
+    lastAttemptAt: 0,         // ms, any attempt
+    lastError: null,          // { at, reason, message } of the last failed refresh, cleared on success
+    available: [],            // [{short,name}] last good `agy models`
+    assignments: Object.fromEntries(Object.entries(MODEL_RULES).map(([id, r]) => [id, { model: r.seed, status: 'unverified' }])),
+    changes: [],              // last 20 automatic switches, newest last
+};
+let modelRefreshInFlight = null;
+
+function fetchAgyModels() {
+    return new Promise((resolve, reject) => {
+        execFile('agy', ['models'], { timeout: 30000, env: { ...process.env, NO_COLOR: '1' }, maxBuffer: 1 << 20 },
+            (err, stdout, stderr) => {
+                if (err) return reject(new Error(`${err.code ?? ''} ${(stderr || err.message).trim().slice(0, 200)}`));
+                resolve(parseAgyModels(stdout));
+            });
+    });
+}
+
+// Re-resolve every id against a fresh `agy models`. Never throws; on failure
+// the last good assignment stays in force. Concurrent callers share one run;
+// outside the timer/start, calls within MODEL_REFRESH_MIN_GAP_MS are skipped.
+function refreshModels(reason) {
+    if (modelRefreshInFlight) return modelRefreshInFlight;
+    if (reason !== 'timer' && reason !== 'start' && Date.now() - modelState.lastAttemptAt < MODEL_REFRESH_MIN_GAP_MS) {
+        return Promise.resolve(false);
+    }
+    modelState.lastAttemptAt = Date.now();
+    modelRefreshInFlight = (async () => {
+        try {
+            const available = await fetchAgyModels();
+            if (!available.length) throw new Error('agy models zwróciło pustą listę');
+            const { assignments, changes } = resolveAll(MODEL_RULES, MODEL_MAP, available);
+            for (const [id, a] of Object.entries(assignments)) if (a.model) MODEL_MAP[id] = a.model;
+            const stamp = new Date().toISOString();
+            for (const c of changes) {
+                console.log(`⇄ model ${c.id}: "${c.from}" → "${c.to}" (${c.why === 'vanished' ? 'poprzedni zniknął z agy models' : 'powrót z zastępstwa'})`);
+                modelState.changes.push({ at: stamp, ...c });
+            }
+            if (modelState.changes.length > 20) modelState.changes.splice(0, modelState.changes.length - 20);
+            for (const [id, a] of Object.entries(assignments)) {
+                if (a.status === 'missing') console.error(`✗ model ${id}: ${a.note}`);
+            }
+            modelState.available = available;
+            modelState.assignments = assignments;
+            modelState.refreshedAt = stamp;
+            modelState.lastError = null;
+            console.log(`✓ agy models odświeżone (${reason}): ${available.length} modeli, zmian ${changes.length}`);
+            return true;
+        } catch (e) {
+            modelState.lastError = { at: new Date().toISOString(), reason, message: e.message };
+            console.error(`✗ agy models nie odświeżone (${reason}): ${e.message} — zostaje ostatnia dobra lista`);
+            return false;
+        } finally {
+            modelRefreshInFlight = null;
+        }
+    })();
+    return modelRefreshInFlight;
+}
+
+// agy's rejection of a stale name ("... is not recognized as a known model ...").
+function isUnknownModelError(text) {
+    return /not recognized as a known model/i.test(text || '');
+}
 
 // ---- Permission roles ----------------------------------------------------
 // agy calls Home Assistant (and Nextcloud, etc.) through its OWN mcp_config,
@@ -196,7 +436,19 @@ const MODEL_MAP = {
 //          and matching is EXACT tool name (no substring, no glob). See
 //          PLAN_ACL_LIMITS.md §7. Optional --mode plan (AGY_RO_PLAN=1) adds an
 //          orthogonal write-block layer that still permits reads.
-// The role is picked by a `-ro` suffix on the model id (see resolveAgyModel):
+//   ops  — the full role (skip-permissions, all MCP servers, shell) MINUS the
+//          Home Assistant config-changing tools, in an isolated HOME
+//          (~/.agy-profiles/ops) built by tools/build-ops-profile.sh from the
+//          full profile + ~/.config/openclaw-claude/ops-deny.json (the same
+//          list claude_proxy.js uses for its `ops`). Two layers, verified on
+//          agy 1.4.5 with skip-permissions: ha-mcp.disabledTools hides the
+//          tools, permissions.deny refuses a call anyway. For agent `main`:
+//          its fallback chain must not regain HA config writes when cc fails.
+//   cfg  — like ops, but for the config writer (agent `ha-yaml`): HA config
+//          changes ARE allowed, only the tools in cfg-deny.json are removed
+//          (ha_restart, 22.10.2026). Same build script, own HOME
+//          (~/.agy-profiles/cfg) and own deny file.
+// The role is picked by a `-ro` / `-ops` / `-cfg` suffix on the model id (see resolveAgyModel):
 // registering `*-ro` ids in openclaw.json makes OpenClaw's own model allowlist
 // the gate for which agent may reach the full role at all.
 const ROLES = {
@@ -205,10 +457,192 @@ const ROLES = {
         home: process.env.AGY_RO_HOME || path.join(os.homedir(), '.agy-profiles/ro'),
         args: process.env.AGY_RO_PLAN === '1' ? ['--mode', 'plan'] : [],
     },
+    ops:  {
+        home: process.env.AGY_OPS_HOME || path.join(os.homedir(), '.agy-profiles/ops'),
+        args: ['--dangerously-skip-permissions'],
+        denyFile: process.env.OPS_DENY_FILE || path.join(os.homedir(), '.config/openclaw-claude/ops-deny.json'),
+    },
+    // web (29.10.2026): Paperclip researcher / security watcher. Profile built by
+    // tools/build-web-profile.sh: MCP only `paperclip`, no read_file / command
+    // rule (agy denies both), web_guard.js hook on URL readers. agy itself has
+    // only search_web (runs at Google), so it cannot reach the LAN.
+    web:  {
+        home: process.env.AGY_WEB_HOME || path.join(os.homedir(), '.agy-profiles/web'),
+        args: [],
+    },
+    cfg:  {
+        home: process.env.AGY_CFG_HOME || path.join(os.homedir(), '.agy-profiles/cfg'),
+        args: ['--dangerously-skip-permissions'],
+        denyFile: process.env.CFG_DENY_FILE || path.join(os.homedir(), '.config/openclaw-claude/cfg-deny.json'),
+    },
+    dev:  {
+        home: process.env.AGY_DEV_HOME || path.join(os.homedir(), '.agy-profiles/dev'),
+        args: ['--dangerously-skip-permissions'],
+    },
 };
+
+// Keep a deny-list profile (ops, cfg) in sync with its sources: rebuild (non-destructive,
+// config files only) when the full profile's MCP config / settings or the
+// deny list is newer than the last build. A failed build refuses the run —
+// ops must fail closed, never fall back to the unfiltered full profile.
+const DEFAULT_DENY_HOMES = { ops: ROLES.ops.home, cfg: ROLES.cfg.home };
+const DEFAULT_DENY_FILES = { ops: ROLES.ops.denyFile, cfg: ROLES.cfg.denyFile };
+const OPS_BUILD_SCRIPT = path.join(__dirname, 'tools/build-ops-profile.sh');
+function ensureDenyProfile(role) {
+    const R = ROLES[role];
+    if (!R) return `Nieznana rola profilu blokad: ${role}`;
+    R.home = (role === 'ops' ? process.env.AGY_OPS_HOME : role === 'cfg' ? process.env.AGY_CFG_HOME : null) || DEFAULT_DENY_HOMES[role] || R.home;
+    R.denyFile = (role === 'ops' ? process.env.OPS_DENY_FILE : role === 'cfg' ? process.env.CFG_DENY_FILE : null) || DEFAULT_DENY_FILES[role] || R.denyFile;
+    const stamp = path.join(R.home, '.gemini/.ops-built');
+    const g = path.join(process.env.AGY_SRC_HOME || os.homedir(), '.gemini');
+    const sources = [
+        R.denyFile,
+        path.join(g, 'config/mcp_config.json'),
+        path.join(g, 'antigravity-cli/mcp_config.json'),
+        path.join(g, 'antigravity-cli/settings.json'),
+        path.join(__dirname, 'mcp/paperclip.js'),
+        path.join(__dirname, 'mcp/infra-read.js'),
+        OPS_BUILD_SCRIPT,
+    ];
+    const mtime = (f) => { try { return fs.statSync(f).mtimeMs; } catch (_) { return 0; } };
+    const built = mtime(stamp);
+    // Content check of the built profile (agy rewrites settings.json on every
+    // start, so mtimes of the outputs are useless): every denied ha-mcp tool
+    // must be both in ha-mcp.disabledTools and in permissions.deny.
+    const intact = () => {
+        try {
+            const deny = JSON.parse(fs.readFileSync(R.denyFile, 'utf8')).deny
+                .filter(t => t.startsWith('mcp__ha-mcp__')).map(t => t.slice('mcp__ha-mcp__'.length));
+            if (!deny.length) return false;
+            const h = path.join(R.home, '.gemini');
+            const st = JSON.parse(fs.readFileSync(path.join(h, 'antigravity-cli/settings.json'), 'utf8'));
+            const rules = new Set((st.permissions && st.permissions.deny) || []);
+            if (!deny.every(t => rules.has(`mcp(ha-mcp/${t})`))) return false;
+            if (!fs.existsSync(path.join(h, 'config/.migrated'))) return false;
+            // Argument guard (tools/ha_guard.js) must be wired with this role.
+            const hk = JSON.parse(fs.readFileSync(path.join(h, 'config/hooks.json'), 'utf8'));
+            const cmd = (((hk['ha-guard'] || {}).PreToolUse || [])[0] || {}).hooks?.[0]?.command || '';
+            if (!cmd.includes('ha_guard.js') || !cmd.includes(` ${role} `) || !cmd.endsWith(' ' + path.resolve(R.denyFile))) return false;
+            for (const rel of ['config/mcp_config.json', 'antigravity-cli/mcp_config.json']) {
+                const m = JSON.parse(fs.readFileSync(path.join(h, rel), 'utf8'));
+                const srvs = m.mcpServers || {};
+                if (!srvs.paperclip || !srvs.infra) return false;
+                const ha = srvs['ha-mcp'];
+                if (ha && !deny.every(t => (ha.disabledTools || []).includes(t))) return false;
+            }
+            return true;
+        } catch (_) { return false; }
+    };
+    if (built && sources.every(f => mtime(f) <= built) && intact()) return null;
+    try {
+        execFileSync(OPS_BUILD_SCRIPT, [], { env: { ...process.env, AGY_OPS_HOME: R.home, OPS_DENY_FILE: R.denyFile, HA_GUARD_ROLE: role }, timeout: 20000, stdio: 'pipe' });
+        if (!intact()) {
+            return `Profil agy '${role}' po przebudowie nadal niezgodny (${R.home}). Odmawiam uruchomienia bez blokady narzędzi HA.`;
+        }
+        console.log(`↻ profil ${role} przebudowany (${R.home})`);
+        return null;
+    } catch (e) {
+        return `Nie udało się zbudować profilu agy '${role}' (${OPS_BUILD_SCRIPT}): ${String((e.stderr || e.message || '')).trim().slice(0, 300)}. Odmawiam uruchomienia bez blokady narzędzi HA.`;
+    }
+}
+// web profile must hold exactly: MCP {paperclip}, no read_file/command allow
+// rules, web_guard hook. Rebuilt when it drifts; a failed build refuses the run.
+const WEB_BUILD_SCRIPT = path.join(__dirname, 'tools/build-web-profile.sh');
+function ensureWebProfile() {
+    const h = path.join(ROLES.web.home, '.gemini');
+    const intact = () => {
+        try {
+            for (const rel of ['config/mcp_config.json', 'antigravity-cli/mcp_config.json']) {
+                const m = JSON.parse(fs.readFileSync(path.join(h, rel), 'utf8'));
+                if (Object.keys(m.mcpServers || {}).join(',') !== 'paperclip') return false;
+            }
+            const st = JSON.parse(fs.readFileSync(path.join(h, 'antigravity-cli/settings.json'), 'utf8'));
+            const allow = (st.permissions && st.permissions.allow) || [];
+            if (st.permissions && st.permissions.defaultMode) return false;
+            if (!allow.every(r => r === 'read_url(*)' || /^mcp\(paperclip\/pc_[a-z_]+\)$/.test(r))) return false;
+            const hk = JSON.parse(fs.readFileSync(path.join(h, 'config/hooks.json'), 'utf8'));
+            const cmd = (((hk['web-guard'] || {}).PreToolUse || [])[0] || {}).hooks?.[0]?.command || '';
+            return cmd.includes('web_guard.js') && Object.keys(hk).join(',') === 'web-guard';
+        } catch (_) { return false; }
+    };
+    if (intact()) return null;
+    try {
+        execFileSync(WEB_BUILD_SCRIPT, [], { env: { ...process.env, AGY_WEB_HOME: ROLES.web.home }, timeout: 20000, stdio: 'pipe' });
+        if (intact()) { console.log(`↻ profil web przebudowany (${ROLES.web.home})`); return null; }
+        return `Profil agy 'web' po przebudowie nadal niezgodny (${h}). Odmawiam uruchomienia.`;
+    } catch (e) {
+        return `Nie udało się zbudować profilu agy 'web' (${WEB_BUILD_SCRIPT}): ${String((e.stderr || e.message || '')).trim().slice(0, 300)}. Odmawiam uruchomienia.`;
+    }
+}
+const DEV_BUILD_SCRIPT = path.join(__dirname, 'tools/build-dev-profile.sh');
+const DEV_GUARD = path.join(__dirname, 'tools/dev_guard.js');
+const DEV_SANDBOX_MCP = path.join(__dirname, 'mcp/dev-sandbox.js');
+function ensureDevProfile() {
+    const devHome = process.env.AGY_DEV_HOME || ROLES.dev.home;
+    ROLES.dev.home = devHome;
+    const h = path.join(devHome, '.gemini');
+    const guardPath = process.env.AGY_DEV_GUARD || DEV_GUARD;
+    const sandboxMcpPath = process.env.AGY_DEV_SANDBOX_MCP || DEV_SANDBOX_MCP;
+    const buildScript = process.env.AGY_DEV_BUILD_SCRIPT || DEV_BUILD_SCRIPT;
+    const intact = () => {
+        try {
+            if (!fs.existsSync(guardPath) || !fs.existsSync(sandboxMcpPath)) return false;
+            if (!fs.existsSync(path.join(h, 'config/.migrated')) || !fs.existsSync(path.join(h, '.dev-built'))) return false;
+            for (const rel of ['config/mcp_config.json', 'antigravity-cli/mcp_config.json']) {
+                const m = JSON.parse(fs.readFileSync(path.join(h, rel), 'utf8'));
+                if (Object.keys(m.mcpServers || {}).sort().join(',') !== 'dev-sandbox,paperclip') return false;
+            }
+            const st = JSON.parse(fs.readFileSync(path.join(h, 'antigravity-cli/settings.json'), 'utf8'));
+            if (st.allowNonWorkspaceAccess !== false) return false;
+            const deny = Array.isArray(st.permissions && st.permissions.deny) ? st.permissions.deny : [];
+            if (!deny.includes('command(*)') || !deny.includes('read_url(*)')) return false;
+            const hk = JSON.parse(fs.readFileSync(path.join(h, 'config/hooks.json'), 'utf8'));
+            if (Object.keys(hk).join(',') !== 'dev-guard') return false;
+            const ptu = ((hk['dev-guard'] || {}).PreToolUse || [])[0] || {};
+            if (ptu.matcher !== '.*') return false;
+            const cmd = ptu.hooks?.[0]?.command || '';
+            return cmd.includes('dev_guard.js');
+        } catch (_) { return false; }
+    };
+    if (intact()) return null;
+    try {
+        execFileSync(buildScript, [], { env: { ...process.env, AGY_DEV_HOME: devHome }, timeout: 20000, stdio: 'pipe' });
+        if (intact()) { console.log(`↻ profil dev przebudowany (${devHome})`); return null; }
+        return `Profil agy 'dev' po przebudowie nadal niezgodny (${h}). Odmawiam uruchomienia.`;
+    } catch (e) {
+        return `Nie udało się zbudować profilu agy 'dev' (${buildScript}): ${String((e.stderr || e.message || '')).trim().slice(0, 300)}. Odmawiam uruchomienia.`;
+    }
+}
+function formatDevReposList(repos) {
+    if (Array.isArray(repos) && repos.length) {
+        const names = repos.map(r => (typeof r === 'string' ? r : (r && (r.name || r.repo || r.subdir || '')))).filter(Boolean);
+        if (names.length) return names.map(n => n.startsWith('./') ? n : `./${n}`).join(', ');
+    }
+    if (repos && typeof repos === 'object') {
+        const keys = Object.keys(repos).filter(Boolean);
+        if (keys.length) return keys.map(k => k.startsWith('./') ? k : `./${k}`).join(', ');
+    }
+    return './openclaw, ./infra-monitor, ./scratch';
+}
+function buildDevPromptNote(devCtx) {
+    if (!devCtx || !devCtx.worktreeRoot) return '';
+    const reposText = formatDevReposList(devCtx.repos);
+    return [
+        '',
+        '',
+        '## Piaskownica wykonawcza (rola dev)',
+        `- Twój przydzielony katalog roboczy (worktreeRoot): \`${devCtx.worktreeRoot}\` (sprawa: \`${devCtx.issueKey || '-'}\`).`,
+        `- Podkatalogi repozytoriów wewnątrz worktreeRoot: ${reposText} (oraz \`./scratch\`). Pracuj wyłącznie wewnątrz \`${devCtx.worktreeRoot}\` — odwołania poza ten katalog są blokowane przez strażnika.`,
+        '- Natywne narzędzie `run_command` oraz dostęp do internetu są wyłączone. Wszystkie polecenia, testy, lintery oraz operacje Git uruchamiaj wyłącznie przez serwer MCP `dev-sandbox`: `dev_info`, `dev_exec`, `dev_git_status`, `dev_git_diff`, `dev_git_commit`.',
+    ].join('\n');
+}
 const DEFAULT_ROLE = (process.env.AGY_DEFAULT_ROLE === 'ro') ? 'ro' : 'full'; // backward compatible
 // Live per-role slot occupancy, surfaced by /healthz.
-const roleActive = { full: 0, ro: 0 };
+const roleActive = { full: 0, ro: 0, ops: 0, cfg: 0, web: 0, dev: 0 };
+// Pool usage state for OpenClaw/Paperclip (DOM-30). Writes only while
+// ~/.openclaw/state/pools/ENABLED exists; every call is guarded inside.
+let pools = null;
+try { pools = createPoolWriter({ proxy: 'agy', getLoad: () => ({ active: sem.active, queued: sem.queued }) }); } catch (e) { console.error(`pools: ${e.message}`); }
 
 // Resolve the requested OpenAI model id to an agy model name + permission role.
 // Accepts our short ids, a "provider/id" form, or an exact agy model name.
@@ -221,21 +655,49 @@ function resolveAgyModel(requested) {
     let id = requested.includes('/') ? requested.split('/').pop() : requested;
     let role = DEFAULT_ROLE;
     if (id.endsWith('-ro')) { role = 'ro'; id = id.slice(0, -3); }
+    else if (id.endsWith('-ops')) { role = 'ops'; id = id.slice(0, -4); }
+    else if (id.endsWith('-cfg')) { role = 'cfg'; id = id.slice(0, -4); }
+    else if (id.endsWith('-web')) { role = 'web'; id = id.slice(0, -4); }
+    else if (id.endsWith('-dev')) { role = 'dev'; id = id.slice(0, -4); }
     if (id === 'antigravity') return { model: AGY_MODEL, role };
-    if (MODEL_MAP[id]) return { model: MODEL_MAP[id], role };
-    if (Object.values(MODEL_MAP).includes(requested)) return { model: requested, role }; // exact agy name
-    return { error: `Nieznany model "${requested}". Dostępne id: antigravity, ${Object.keys(MODEL_MAP).join(', ')} (sufiks -ro = rola read-only)` };
+    if (MODEL_MAP[id]) return { model: MODEL_MAP[id], role, id };
+    if (Object.values(MODEL_MAP).includes(requested)) return { model: requested, role }; // exact agy name (not re-resolved)
+    const byShort = (modelState.available || []).find(m => m.short === id);
+    if (byShort) return { model: byShort.name, role };
+    return { error: `Nieznany model "${requested}". Dostępne id: antigravity, ${Object.keys(MODEL_MAP).join(', ')} (sufiks -ro = rola read-only, -ops = pełna bez zmian konfiguracji HA, -cfg = pełna bez restartu HA, -web = tylko wyszukiwarka i Paperclip, -dev = piaskownica programisty)` };
 }
 
 // agy >= 1.1.0 swallows backend errors in --print mode: exit code 0, empty
 // stdout, empty stderr. The only trace is its glog log file, so each request
 // runs with a private --log-file and we mine it for the real error.
 // glog error lines look like: "E0708 11:44:42.620606 98256 log.go:398] msg"
+// Lines that describe the CAUSE of a failure, whenever one is present.
+const GLOG_CAUSE_RE = /RESOURCE_EXHAUSTED|permission check failed|quota reached|user denied permission/i;
+// Lines that are consequences of the run ending — several of them are produced
+// by our OWN kill, so reporting them as "the error" is circular. Measured
+// 2026-09-11 on preserved glogs: a run killed by the STUCK watchdog reported
+// "error running grep: signal: killed" (the grep we killed) and two quota
+// failures reported "You are not logged into Antigravity" (torn-down auth
+// during shutdown) instead of the quota line that actually caused them.
+const GLOG_TEARDOWN_RE = /signal: killed|app root path missing|Language server shutting down|Language server shutdown timed out|skipping empty or temp file|store manager shutting down/i;
+
 function extractAgyError(logText) {
     if (!logText) return null;
-    const errLines = logText.split('\n').filter(l => /^E\d{4} /.test(l));
-    if (!errLines.length) return null;
-    let msg = errLines[errLines.length - 1].replace(/^E\d{4} \S+\s+\d+ \S+\]\s*/, '').trim();
+    const strip = l => l.replace(/^[EIWF]\d{4} \S+\s+\d+ \S+\]\s*/, '').trim();
+    const all = logText.split('\n');
+    const errLines = all.filter(l => /^E\d{4} /.test(l)).map(strip).filter(Boolean);
+    // A cause can be logged below error level: since the quota fail-fast kills
+    // agy on its FIRST 429, agy never reaches its own E-level "agent executor
+    // error: ... RESOURCE_EXHAUSTED" summary, and the only trace left is the
+    // I-level "Run: attempt N failed (RESOURCE_EXHAUSTED ...)". So look for
+    // causes across all levels, and only fall back to E-lines for the rest.
+    const causes = all.filter(l => GLOG_CAUSE_RE.test(l)).map(strip).filter(Boolean);
+    if (!errLines.length && !causes.length) return null;
+    // Prefer a causal line; else the newest E-line that isn't teardown noise;
+    // else fall back to the newest E-line at all, so something is always reported.
+    const nonNoise = errLines.filter(l => !GLOG_TEARDOWN_RE.test(l));
+    const pool = causes.length ? causes : (nonNoise.length ? nonNoise : errLines);
+    let msg = pool[pool.length - 1];
     // agy doubles the message as "X: X" — collapse the repeat.
     const dup = msg.match(/^(.*): \1$/s);
     if (dup) msg = dup[1];
@@ -265,23 +727,102 @@ function summarizeAgyError(raw) {
 // Prefer (2) for a self-consistent class+target; fall back to (1)'s class with a
 // null target. Returns {permClass, target} or null if this was not a denial.
 function classifyDenial(logText, errOut, out) {
+    // The soft-deny line carries the step index of the refused call. Read it
+    // up front: with parallel tool calls agy cancels the sibling calls too
+    // (also status=6), so without the index the wrong tool got blamed
+    // (22.10.2026: ha_get_zone denied at step 5, ha_get_state at 6 reported).
+    const soft = (logText || '').match(/soft-denying tool confirmation "([^"]+)"(?:\s+at step (\d+))?/);
+    const softStep = soft && soft[2] !== undefined ? parseInt(soft[2], 10) : null;
     const glog = (logText || '').match(/permission check failed for (\S+)\s+"([^"]+)"/);
-    if (glog) return { permClass: glog[1], target: glog[2] };
+    if (glog) return { permClass: glog[1], target: glog[2], stepIdx: softStep };
     const notice = `${errOut || ''}\n${out || ''}\n${logText || ''}`
         .match(/required the "?(mcp|command|read_file)"? permission that headless mode cannot prompt for/);
-    if (notice) return { permClass: notice[1], target: null };
+    if (notice) return { permClass: notice[1], target: null, stepIdx: softStep };
+    // Third signature, and on 2026-09-11 / 2026-10-20 the ONLY one present in the
+    // glog of a real RO denial: agy's own "soft-deny" line. It names the tool
+    // (and step index in agy >= 1.4), not the permission class, so map it; the
+    // concrete target comes from the trajectory DB (readDenialDetail).
+    if (soft) {
+        const tool = soft[1];
+        const stepIdx = softStep;
+        const permClass = /^run/i.test(tool) ? 'command'
+            : /^(view|read)/i.test(tool) ? 'read_file'
+            : /mcp/i.test(tool) ? 'mcp'
+            : tool;
+        return { permClass, target: null, stepIdx };
+    }
     return null;
+}
+
+// The exact thing agy was denied, read from the conversation trajectory: the
+// glog records only the tool NAME ("RunCommand"), while the DB row carries the
+// full command line / file path plus agy's error text. Without this the
+// operator was told "Cel nieustalony" and had nothing to put on the allowlist.
+// In agy >= 1.4.2, a soft-denied step has status=6 and error_details IS NULL,
+// while earlier steps that returned a normal tool error to the model have
+// status=7 and error_details IS NOT NULL — so prefer the step index from the
+// glog or status=6 over error_details IS NOT NULL.
+function readDenialDetail(dbPath, stepIdx = null) {
+    if (!DatabaseSync || !dbPath) return null;
+    let db;
+    try {
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        let rows = [];
+        if (Number.isInteger(stepIdx)) {
+            rows = db.prepare('select idx, metadata, error_details from steps where idx = ? limit 1').all(stepIdx);
+        }
+        if (!rows.length) {
+            rows = db.prepare('select idx, metadata, error_details from steps where status = 6 or error_details is not null order by (status = 6) desc, case when status = 6 then idx end asc, idx desc limit 1').all();
+        }
+        if (!rows.length) return null;
+        const meta = rows[0].metadata ? Buffer.from(rows[0].metadata).toString('utf8') : '';
+        const err = rows[0].error_details ? Buffer.from(rows[0].error_details).toString('utf8') : '';
+        const cmd = meta.match(/"CommandLine":"((?:[^"\\]|\\.)*)"/);
+        const file = meta.match(/"(?:Absolute)?Path":"([^"]*)"/);
+        const mcpSrv = meta.match(/"ServerName":"([^"]*)"/);
+        const mcpTool = meta.match(/"ToolName":"([^"]*)"/);
+        const mcpTarget = (mcpSrv && mcpTool) ? `${mcpSrv[1]}/${mcpTool[1]}`.slice(0, 200) : (mcpTool ? mcpTool[1].slice(0, 100) : null);
+        const label = meta.match(/"(?:toolAction|toolSummary)":"([^"]*)"/);
+        const target = cmd ? cmd[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\').slice(0, 400) : (file ? file[1].slice(0, 300) : mcpTarget);
+        // error_details is a protobuf blob; keep only its readable run of text.
+        const msg = err.replace(/[^\x20-\x7E -ɏ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) || null;
+        return { target, label: label ? label[1].slice(0, 80) : null, msg };
+    } catch (e) {
+        return null;
+    } finally {
+        try { db && db.close(); } catch (e) {}
+    }
 }
 
 // User-facing message for a permission denial. Always names the role and the
 // profile's settings.json so the operator knows exactly which allowlist to edit;
 // names the concrete target when it could be recovered from agy's log.
-function buildPermissionError(role, permClass, target, settingsPath) {
+function buildPermissionError(role, permClass, target, settingsPath, label) {
     const where = settingsPath ? ` Dodaj regułę w ${settingsPath}.` : '';
+    const what = label ? ` (krok agy: "${label}")` : '';
     if (target) {
-        return `agy odmówił uprawnienia: narzędzie klasy '${permClass}' na cel "${target}" nie jest w allowliście roli '${role}'.${where}`;
+        return `agy odmówił uprawnienia: narzędzie klasy '${permClass}' na cel "${target}" nie jest w allowliście roli '${role}'${what}. Dopisz '${permClass}(${target})' do allowlisty.${where}`;
     }
-    return `agy odmówił uprawnienia klasy '${permClass}' (rola '${role}'). Cel nieustalony z logu — dodaj regułę '${permClass}(<cel>)' w allowliście.${where}`;
+    return `agy odmówił uprawnienia klasy '${permClass}' (rola '${role}')${what}. Celu nie udało się ustalić ani z logu, ani z trajektorii — dodaj regułę '${permClass}(<cel>)' w allowliście.${where}`;
+}
+
+// Machine-readable label for a failed run. Kept as one function so the stream
+// and buffered paths cannot drift apart — they previously disagreed (buffered
+// collapsed every timeout into 'agy_failed'), which made proxy logs and cron
+// history describe the same failure differently.
+// Minutes for humans: STUCK_NO_OUTPUT_MS is env-tunable, so a raw /60000
+// printed things like "0.16666666666666666 min" in the user-facing message.
+const mins = ms => Number((ms / 60000).toFixed(1));
+
+function failureCode({ spawnErr, timedOut, code, emptyFail, quotaExhausted }) {
+    if (quotaExhausted) return 'quota_exhausted';
+    if (spawnErr) return 'spawn_failed';
+    if (timedOut === 'stuck') return 'stuck_no_progress';
+    if (timedOut === 'idle') return 'idle_timeout';
+    if (timedOut === 'hard') return 'hard_timeout';
+    if (code !== 0) return 'agy_failed';
+    if (emptyFail) return 'empty_response';
+    return 'agy_failed';
 }
 
 // Live-tail agy's private glog file and report agent-loop activity. Each
@@ -291,9 +832,23 @@ function buildPermissionError(role, permClass, target, settingsPath) {
 // activity — glog writes periodic noise (quota refresh etc.) even when the
 // agent loop is stuck, and that must not defeat the idle timeout.
 // Returns a stop() function; safe if the file doesn't exist yet.
-function watchAgyLog(logFile, onRound) {
+// onQuota (optional) fires ONCE, with the parsed reset delay in ms, the first
+// time a RESOURCE_EXHAUSTED line with a reset ETA past QUOTA_FAIL_FAST_MS is
+// seen — this is what lets runAgy kill a quota-exhausted attempt immediately
+// instead of riding out agy's own multi-minute internal retry loop.
+function watchAgyLog(logFile, onRound, onQuota, onConversation, onShutdown) {
     let offset = 0;
     let leftover = '';
+    // Read boundaries fall on arbitrary byte offsets, so a chunk can end in the
+    // middle of a multi-byte character. `leftover` only carries a torn LINE
+    // across reads; StringDecoder does the same for a torn CHARACTER, holding
+    // the incomplete bytes until the next read completes them. Today every
+    // pattern below is ASCII (and a mangled character stays local, so matches
+    // survive) — this keeps that true if a future pattern is not.
+    const decoder = new StringDecoder('utf8');
+    let quotaFired = false;
+    let lastConv = null;
+    let shutdownFired = false;
     const timer = setInterval(() => {
         let fd;
         try {
@@ -304,10 +859,28 @@ function watchAgyLog(logFile, onRound) {
             const buf = Buffer.alloc(len);
             fs.readSync(fd, buf, 0, len, offset);
             offset = size;
-            const lines = (leftover + buf.toString('utf8')).split('\n');
+            const lines = (leftover + decoder.write(buf)).split('\n');
             leftover = lines.pop();
             for (const line of lines) {
                 if (line.includes('streamGenerateContent')) onRound();
+                if (!shutdownFired && onShutdown && line.includes('CLI store manager shutting down')) {
+                    shutdownFired = true;
+                    onShutdown();
+                }
+                if (onConversation) {
+                    // "Streaming conversation <uuid>" names the trajectory DB for
+                    // this run; agy can switch conversations mid-run, so react to
+                    // the latest one seen, not just the first.
+                    const conv = line.match(/Streaming conversation ([0-9a-f-]{36})/);
+                    if (conv && conv[1] !== lastConv) { lastConv = conv[1]; onConversation(conv[1]); }
+                }
+                if (!quotaFired && onQuota && line.includes('RESOURCE_EXHAUSTED')) {
+                    const resetMs = matchQuotaReset(line);
+                    if (resetMs !== null && resetMs >= QUOTA_FAIL_FAST_MS) {
+                        quotaFired = true;
+                        onQuota(resetMs);
+                    }
+                }
             }
         } catch (e) {
             // log file not created yet, or vanished — ignore
@@ -326,30 +899,128 @@ function watchAgyLog(logFile, onRound) {
 // (no subprocess spawn): field 5 of /proc/<pid>/stat is the process-group id;
 // comm (field 2) may hold spaces/parens, so we parse from just after the final ')'.
 //
-// Only a child in state R (running) or D (uninterruptible IO) counts. agy keeps
+// Only a child in state R (running) or D (uninterruptible IO) counts as BUSY
+// here. That is deliberately narrow, and it is not the whole story: a tool
+// blocked on a socket or a `sleep` sits in S, indistinguishable by state from an
+// idle server, so the watchdog pairs this with the descendant list below (a
+// child that appeared since the last real progress is work, whatever its
+// state). agy keeps
 // long-lived MCP servers (e.g. mcp-nextcloud-rag) as children that sit idle in
 // state S the whole run; counting those made hasActiveToolChild permanently true,
 // which silently defeated BOTH the idle and stuck detectors so every wedged run
 // rode HARD to 30 min. An idle background server is S and must be ignored; a
 // foreground tool doing work is R or D.
-function hasActiveToolChild(pgid) {
+//
+// Walks the PPID tree, NOT the process group: verified empirically
+// (2026-09-10, `ps --forest` while a bash tool ran) that agy puts every tool
+// subprocess in its OWN new process group (setpgid/setsid on spawn) — a tool
+// child's pgrp is its own pid, never agy's. A pgid-equality check (the
+// original approach) therefore never matches a real tool child; it only
+// happened to look correct because it also never false-positived. PPID is
+// the only link back to agy that survives that regrouping, so this walks
+// descendants (any depth — a tool can itself fork, e.g. bash -> find) via
+// parent-pid, not process-group membership.
+//
+// Returns { active, comm } — comm is just the binary name (e.g. "curl",
+// "bash"), never the full argv, so it's safe to show a viewer: no path, no
+// flags, no secrets that a command's arguments might carry (a token in a curl
+// -H, a password in a URL). If more than one descendant is busy, the first
+// R/D hit wins — good enough for a "what's it doing" status line, not an audit.
+// `descendants` carries the same safe fields ({pid, comm, state}) for every
+// descendant, busy or not, so the caller can diff the set across ticks.
+function hasActiveToolChild(rootPid) {
     let procs;
-    try { procs = fs.readdirSync('/proc'); } catch (e) { return false; }
+    try { procs = fs.readdirSync('/proc'); } catch (e) { return { active: false, comm: null, descendants: [] }; }
+    const childrenOf = new Map(); // ppid -> [{pid, state, comm}]
     for (const name of procs) {
         if (!/^\d+$/.test(name)) continue;
         const pid = parseInt(name, 10);
-        if (pid === pgid) continue;
+        if (pid === rootPid) continue;
         let stat;
         try { stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8'); } catch (e) { continue; }
+        const lp = stat.indexOf('(');
         const rp = stat.lastIndexOf(')');
-        if (rp === -1) continue;
-        // after ') ' come: state(3) ppid(4) pgrp(5) ...
+        if (lp === -1 || rp === -1) continue;
+        const comm = stat.slice(lp + 1, rp);
+        // after ') ' come: state(3) ppid(4) ...
         const fields = stat.slice(rp + 2).trim().split(/\s+/);
-        if (parseInt(fields[2], 10) !== pgid) continue;
+        const ppid = parseInt(fields[1], 10);
         const state = fields[0];
-        if (state === 'R' || state === 'D') return true; // busy; keep scanning past idle (S) children
+        const pgrp = parseInt(fields[2], 10);
+        if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+        childrenOf.get(ppid).push({ pid, state, comm, pgrp });
     }
-    return false;
+    const queue = [rootPid];
+    const seen = new Set(queue);
+    const descendants = [];
+    let active = false;
+    let comm = null;
+    while (queue.length) {
+        const pid = queue.shift();
+        for (const c of childrenOf.get(pid) || []) {
+            if (seen.has(c.pid)) continue;
+            seen.add(c.pid);
+            descendants.push({ pid: c.pid, comm: c.comm, state: c.state, pgrp: c.pgrp });
+            if (!active && (c.state === 'R' || c.state === 'D')) { active = true; comm = c.comm; }
+            queue.push(c.pid);
+        }
+    }
+    // The full descendant list (not just the first R/D hit) is returned because
+    // the watchdog also needs to spot a child that is merely NEW — a tool
+    // blocked on a socket or a sleep sits in S and would otherwise be invisible;
+    // `pgrp` is what separates a tool child (leads its own group) from an idle
+    // MCP server (still in its parent's group).
+    return { active, comm, descendants };
+}
+
+// Broad, safe-to-display category for a tool child's binary name — no args,
+// so nothing a command's arguments might carry (tokens, paths, secrets) ever
+// reaches this. Unrecognized binaries still get a label (the name itself is
+// just a program name, not sensitive).
+const TOOL_CATEGORIES = [
+    { match: /^(bash|sh|zsh|dash|python3?|node|ruby|perl|php)\d*$/, label: 'wykonuje kod/skrypt' },
+    { match: /^(curl|wget)$/, label: 'pobiera dane z sieci' },
+    { match: /^(ssh|sshfs|scp|rsync)$/, label: 'łączy się z innym hostem' },
+    { match: /^git$/, label: 'operacja git' },
+    { match: /^(grep|rg|find|fd|cat|awk|sed|ls)$/, label: 'przeszukuje/czyta pliki' },
+    { match: /^(chromium|chrome|xdg-open)$/i, label: 'otwiera przeglądarkę' },
+];
+function classifyTool(comm) {
+    if (!comm) return null;
+    const rule = TOOL_CATEGORIES.find(r => r.match.test(comm));
+    return rule ? rule.label : `wykonuje narzędzie (${comm})`;
+}
+
+// Where agy stores the trajectory for one conversation. The RO role runs under
+// its own HOME, so the path follows the role's HOME, not the proxy's.
+function convDbPath(home, convId) {
+    return path.join(home || os.homedir(), '.gemini/antigravity-cli/conversations', `${convId}.db`);
+}
+
+// Rows agy appended to the trajectory since `sinceIdx`. Read-only, and safe to
+// call while agy is writing: the DB runs in WAL mode, so a reader never blocks
+// the writer (validated live — 40+ polls during an active run, zero lock
+// errors). `step_payload` is deliberately NOT selected: it holds the full
+// prompt/response (100KB+ per row), while `metadata` is a couple of KB and
+// already carries the tool name and agy's own human-readable action label.
+// Any failure (file not created yet, torn write, schema change) returns [] —
+// the caller then just falls back to the other progress signals.
+function readNewSteps(dbPath, sinceIdx) {
+    if (!DatabaseSync || !dbPath) return [];
+    let db;
+    try {
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        return db.prepare('select idx, status, metadata from steps where idx > ? order by idx').all(sinceIdx)
+            .map(r => {
+                const meta = r.metadata ? Buffer.from(r.metadata).toString('utf8') : '';
+                const label = meta.match(/"(?:toolAction|toolSummary)":"([^"]*)"/);
+                return { idx: r.idx, status: r.status, label: label ? label[1].slice(0, 80) : null };
+            });
+    } catch (e) {
+        return [];
+    } finally {
+        try { db && db.close(); } catch (e) {}
+    }
 }
 
 // Extract plain text from an OpenAI message `content` field, which may be a
@@ -366,18 +1037,45 @@ function contentToText(content) {
     return JSON.stringify(content);
 }
 
+// Footer label: the model that really answered, plus a marker when the id is
+// served by a stand-in (e.g. gemini-pro while agy lists no Pro model), so the
+// footer never looks like it contradicts the model picked in OpenClaw.
+function footerModel(name, id) {
+    const a = id && modelState.assignments[id];
+    return (a && a.status === 'substitute' && a.model === name) ? `${name} (zastępstwo za ${id})` : name;
+}
+
 // Strip OpenClaw metadata timestamps like "[Fri 2026-07-03 19:15 GMT+2] ".
 function stripTimestamp(text) {
     return text.replace(/^\[.*?\]\s*/, '').trim();
 }
 
+// Exact-match control sentinels that OpenClaw cron/heartbeat contracts compare
+// verbatim (e.g. "if reply === NO_REPLY, suppress delivery"). Our own
+// "— model: X" footer below used to be appended unconditionally, which broke
+// every one of these checks silently: the werdykt was still "NO_REPLY" to a
+// human eye but no longer matched byte-for-byte, so it got delivered as if it
+// were a real report. Discovered 2026-09-11 (owner: "napraw by no reply nie
+// przychodziło jako alert"). Prefix-based contracts (HEARTBEAT_OK) mostly
+// survived this bug already; kept here too so they can't regress the same way.
+const CONTROL_SENTINELS = ['NO_REPLY', 'HEARTBEAT_OK'];
+const CONTROL_PREFIXES = ['WATCHDOG_FAIL', 'CANARY-'];
+function isControlSentinel(text) {
+    const t = text.trim();
+    return CONTROL_SENTINELS.includes(t) || CONTROL_PREFIXES.some(p => t.startsWith(p));
+}
+
 // Remove our own progress-tick segments (⏳/⌛ …) and error notices
 // (⚠️ [proxy] …) so they don't accumulate in the conversation history fed
-// back to agy later.
+// back to agy later. Also restore 40-char path prefixes falsely masked by
+// OpenClaw >= 2026.10.4's AWS_SECRET_ACCESS_KEY_MATCHER (/home/…HDOG.md).
 function stripProgress(text) {
     return text
+        .replace(/\/home\/…HDOG\.md/g, '/home/bl/projects/homeassistant/WATCHDOG.md')
+        .replace(/\/home\/…TITY\.md/g, '/home/bl/projects/homeassistant/IDENTITY.md')
         .replace(/\r?[⏳⌛][^\r\n]*/g, '')
         .replace(/⚠️?\s*\[proxy\][^\r\n]*/g, '')
+        .replace(/\n\n— model: [^\r\n]*$/, '') // our own "which model answered" footer
         .replace(/\r/g, '')
         .replace(/^\n+/, '')
         .trim();
@@ -433,8 +1131,10 @@ const server = http.createServer((req, res) => {
         res.setHeader('Content-Type', 'application/json');
         const baseIds = ["antigravity", ...Object.keys(MODEL_MAP)];
         // Advertise each id in both roles: bare = full (or AGY_DEFAULT_ROLE),
-        // `-ro` = read-only. Register the ones you want selectable in openclaw.json.
-        const ids = [...baseIds, ...baseIds.map(id => `${id}-ro`)];
+        // `-ro` = read-only, `-ops` = full minus HA config writes,
+        // `-cfg` = full minus cfg-deny.json (ha_restart).
+        // Register the ones you want selectable in openclaw.json.
+        const ids = [...baseIds, ...['ro', 'ops', 'cfg', 'web', 'dev'].flatMap(r => baseIds.map(id => `${id}-${r}`))];
         res.end(JSON.stringify({
             object: "list",
             data: ids.map(id => ({ id, object: "model", owned_by: "local" }))
@@ -451,11 +1151,35 @@ const server = http.createServer((req, res) => {
             queued: sem.queued,
             maxConcurrent: MAX_CONCURRENT,
             maxQueue: MAX_QUEUE,
-            roles: { full: roleActive.full, ro: roleActive.ro },
+            roles: { ...roleActive },
             roHome: ROLES.ro.home,
+            opsHome: ROLES.ops.home,
+            cfgHome: ROLES.cfg.home,
+            devHome: process.env.AGY_DEV_HOME || ROLES.dev.home,
             defaultRole: DEFAULT_ROLE,
             uptimeSec: Math.round(process.uptime()),
+            // Model catalogue health — read by watchdog_meta_check.py (row 5).
+            models: {
+                refreshedAt: modelState.refreshedAt,
+                refreshEveryMin: Math.round(MODEL_REFRESH_MS / 60000),
+                lastError: modelState.lastError,
+                available: modelState.available.map(m => m.name),
+                assignments: modelState.assignments,
+                changes: modelState.changes,
+            },
         }));
+        return;
+    }
+
+    // Recent console output (ring buffer, last LOG_BUFFER_MAX lines) — quick
+    // debug from a browser/curl on the Pi without an SSH session + journalctl.
+    // ?n=N caps how many of the most recent lines come back (default: all).
+    if (req.url === '/logs' || req.url.startsWith('/logs?')) {
+        const reqUrl = new URL(req.url, 'http://localhost');
+        const n = parseInt(reqUrl.searchParams.get('n'), 10);
+        const lines = (Number.isFinite(n) && n > 0) ? logBuffer.slice(-n) : logBuffer;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ lines, total: logBuffer.length, max: LOG_BUFFER_MAX }));
         return;
     }
 
@@ -463,19 +1187,21 @@ const server = http.createServer((req, res) => {
         let body = '';
         req.on('data', chunk => { body += chunk.toString(); });
 
-        req.on('end', () => {
-            let data;
+        req.on('end', async () => {
+            let isStream = false;
             try {
-                data = JSON.parse(body);
-            } catch (e) {
-                res.statusCode = 400;
-                res.setHeader('Content-Type', 'application/json');
-                res.end(JSON.stringify({ error: "Błędny format JSON" }));
-                return;
-            }
+                let data;
+                try {
+                    data = JSON.parse(body);
+                } catch (e) {
+                    res.statusCode = 400;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: "Błędny format JSON" }));
+                    return;
+                }
 
-            const messages = data.messages || [];
-            const isStream = data.stream === true;
+                const messages = data.messages || [];
+                isStream = data.stream === true;
             const modelName = data.model || "antigravity";
             const resolved = resolveAgyModel(data.model);
 
@@ -502,9 +1228,19 @@ const server = http.createServer((req, res) => {
                 }
                 return;
             }
-            const agyModel = resolved.model;
+            let agyModel = resolved.model;   // re-resolved once if agy rejects the name (see retryAfterUnknownModel)
             const role = resolved.role || DEFAULT_ROLE;
             const roleCfg = ROLES[role] || ROLES.full;
+            if (role === 'ops' || role === 'cfg' || role === 'web') {
+                const opsErr = role === 'web' ? ensureWebProfile() : ensureDenyProfile(role);
+                if (opsErr) {
+                    console.log(`✗ ${opsErr}`);
+                    res.statusCode = 500;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: opsErr, type: 'agy_error', code: 'ops_profile_error', role } }));
+                    return;
+                }
+            }
 
             if (!messages.length) {
                 res.statusCode = 400;
@@ -513,7 +1249,172 @@ const server = http.createServer((req, res) => {
                 return;
             }
 
-            const prompt = buildPrompt(messages);
+            // In-proxy retry hook: when agy rejected the model NAME (its catalogue
+            // changed under us), refresh `agy models` first so the retry goes out
+            // with the replacement instead of repeating the same dead name. Only
+            // for requests made by id; an exact agy name is the caller's choice.
+            const retryAfterUnknownModel = (result, next) => {
+                const why = `${result.errOut || ''}\n${result.logErr || ''}`;
+                if (!resolved.id || !isUnknownModelError(why)) return next();
+                refreshModels('unknown-model').then(() => {
+                    const fresh = MODEL_MAP[resolved.id];
+                    if (fresh && fresh !== agyModel) {
+                        console.log(`⇄ ponowienie ${resolved.id}: "${agyModel}" → "${fresh}"`);
+                        agyModel = fresh;
+                    } else {
+                        console.error(`✗ agy odrzucił "${agyModel}", a odświeżona lista nie dała zamiennika dla ${resolved.id}`);
+                    }
+                    next();
+                });
+            };
+
+            // Paperclip wake: run context goes to the MCP bridge as env, the
+            // adapter's HTTP procedure is replaced (tools/paperclip_wake.js).
+            const pc = applyPaperclipWake(buildPrompt(messages));
+            let prompt = pc.text;
+            const pcEnv = pc.env;
+            if (pcEnv) console.log(`  paperclip: run=${pcEnv.PAPERCLIP_RUN_ID} agent=${pcEnv.PAPERCLIP_AGENT_ID} task=${pcEnv.PAPERCLIP_TASK_ID || '-'} powód=${pcEnv.PAPERCLIP_WAKE_REASON || '-'} przepisano=${pc.rewritten}`);
+            let pcCheck = null;
+            if (pcEnv && role !== 'ro' && role !== 'web') {
+                let check;
+                try {
+                    const approvals = getApprovals();
+                    if (!approvals) throw new Error('brak modułu paperclip_approvals');
+                    check = await approvals.verifyProxyExecRun({ pcEnv, role });
+                } catch (e) {
+                    check = { ok: false, code: 'paperclip_approval_denied', reason: e.message };
+                }
+                if (res.destroyed || res.writableEnded) return;
+                if (!check.ok) {
+                    if (check.idle === true) {
+                        console.log(`ℹ paperclip exec idle: run=${pcEnv.PAPERCLIP_RUN_ID} rola=${role} (brak zadania, zwrot odpowiedzi gotowości)`);
+                        if (isStream) {
+                            res.setHeader('Content-Type', 'text/event-stream');
+                            res.setHeader('Cache-Control', 'no-cache');
+                            res.setHeader('Connection', 'keep-alive');
+                            res.write(`data: ${JSON.stringify({
+                                id: `chatcmpl-${Date.now()}`,
+                                object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000),
+                                model: modelName,
+                                choices: [{ delta: { content: check.reason }, index: 0, finish_reason: 'stop' }]
+                            })}\n\n`);
+                            res.write('data: [DONE]\n\n');
+                            res.end();
+                        } else {
+                            res.statusCode = 200;
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify({
+                                id: `chatcmpl-${Date.now()}`,
+                                object: "chat.completion",
+                                created: Math.floor(Date.now() / 1000),
+                                model: modelName,
+                                choices: [{ message: { role: "assistant", content: check.reason }, finish_reason: 'stop', index: 0 }]
+                            }));
+                        }
+                        return;
+                    }
+                    console.error(`✗ paperclip: przebieg ${pcEnv.PAPERCLIP_RUN_ID} w roli ${role} odrzucony (${check.code}): ${check.reason}`);
+                    if (isStream) {
+                        res.setHeader('Content-Type', 'text/event-stream');
+                        res.setHeader('Cache-Control', 'no-cache');
+                        res.setHeader('Connection', 'keep-alive');
+                        res.write(`data: ${JSON.stringify({
+                            id: `chatcmpl-${Date.now()}`,
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: modelName,
+                            choices: [{ delta: { content: `🛑 [Paperclip Governance] Przebieg w roli ${role} zablokowany (${check.code}): ${check.reason}` }, index: 0, finish_reason: 'stop' }]
+                        })}\n\n`);
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                        return;
+                    }
+                    res.statusCode = 403;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: check.reason || `Przebieg z Paperclipa w roli ${role} jest zablokowany.`, type: 'agy_error', code: check.code || 'paperclip_role_denied', role } }));
+                    return;
+                }
+                pcCheck = check;
+                console.log(`✓ paperclip exec: run=${pcEnv.PAPERCLIP_RUN_ID} grant=${check.grantId} confirmation=${check.confirmationId} rola=${role}`);
+            }
+            let devCtx = null;
+            if (role === 'dev') {
+                let issueKey = null;
+                let allowLocal = false;
+                if (pcEnv) {
+                    issueKey = (pcCheck && (pcCheck.parentIdentifier || pcCheck.parentIssueId)) || null;
+                    if (!issueKey) {
+                        res.statusCode = 403;
+                        res.setHeader('Content-Type', 'application/json');
+                        res.end(JSON.stringify({ error: { message: 'Brak identyfikatora sprawy nadrzędnej dla roli dev.', type: 'agy_error', code: 'paperclip_approval_denied', role } }));
+                        return;
+                    }
+                } else {
+                    const rawLocalKey = Array.isArray(req.headers['x-dev-issue-key'])
+                        ? req.headers['x-dev-issue-key'][0]
+                        : req.headers['x-dev-issue-key'];
+                    const localKey = typeof rawLocalKey === 'string' ? rawLocalKey.trim() : '';
+                    if (process.env.AGY_ALLOW_LOCAL_DEV === '1' && localKey) {
+                        issueKey = localKey;
+                        allowLocal = true;
+                    } else {
+                        console.error(`✗ rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.`);
+                        res.statusCode = 403;
+                        res.setHeader('Content-Type', 'application/json');
+                        res.end(JSON.stringify({ error: { message: "Rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.", type: 'agy_error', code: 'dev_requires_paperclip_issue', role } }));
+                        return;
+                    }
+                }
+                const devProfileErr = ensureDevProfile();
+                if (devProfileErr) {
+                    console.error(`✗ ${devProfileErr}`);
+                    res.statusCode = 500;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: devProfileErr, type: 'agy_error', code: 'dev_profile_error', role } }));
+                    return;
+                }
+                try {
+                    const devWs = getDevWorkspace();
+                    if (!devWs || typeof devWs.ensureDevWorkspace !== 'function') {
+                        throw new Error('brak modułu dev_workspace');
+                    }
+                    const wsOpts = { issueKey, allowLocal };
+                    if (process.env.DEV_WORKTREES_BASE) wsOpts.worktreesBase = process.env.DEV_WORKTREES_BASE;
+                    const ws = await devWs.ensureDevWorkspace(wsOpts);
+                    if (res.destroyed || res.writableEnded) return;
+                    if (!ws || !ws.ok || !ws.rootDir) {
+                        throw new Error((ws && ws.reason) || 'ensureDevWorkspace nie zwróciło rootDir');
+                    }
+                    devCtx = {
+                        worktreeRoot: ws.rootDir,
+                        issueKey: ws.issueKey || issueKey,
+                        repos: ws.repos || null,
+                    };
+                } catch (e) {
+                    if (res.destroyed || res.writableEnded) return;
+                    console.error(`✗ błąd piaskownicy dev (${issueKey}): ${e.message}`);
+                    res.statusCode = 500;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: `Nie udało się przygotować piaskownicy dev: ${e.message}`, type: 'agy_error', code: 'dev_workspace_error', role } }));
+                    return;
+                }
+                prompt += buildDevPromptNote(devCtx);
+            }
+            // A permission denial ends agy's whole --print run: the model never
+            // learns the tool was refused. One in-proxy retry tells it which
+            // call was blocked; a second denial is returned as a normal answer
+            // (not an error), so OpenClaw does not walk the whole fallback chain
+            // (measured 22.10.2026: one denial = 4 retries on Flash, 4 on
+            // Sonnet, then Claude Code, 80 s, and the cc 5 h window burned).
+            const addDenialHint = (result) => {
+                const what = result.permissionTarget ? `"${result.permissionTarget}"` : `klasy '${result.permissionClass}'`;
+                const devHint = (role === 'dev' && devCtx)
+                    ? ` Używaj wyłącznie narzędzi MCP 'dev-sandbox' (dev_info, dev_exec, dev_git_status, dev_git_diff, dev_git_commit) oraz ścieżek wewnątrz ${devCtx.worktreeRoot}.`
+                    : '';
+                prompt += `\n\n[PROXY] Poprzednia próba została przerwana: wywołałeś narzędzie ${what}, które w Twojej roli ('${role}') jest zablokowane. Nie wołaj go ponownie${(role === 'ro' || role === 'web' || role === 'dev') ? ' i nie sprawdzaj listy narzędzi poleceniami powłoki (w tej roli natywna powłoka też jest zablokowana)' : ''}.${devHint} Wykonaj zadanie innymi narzędziami, które masz. Jeśli bez niego się nie da, odpowiedz od razu, krótko: czego nie możesz zrobić i dlaczego.`;
+            };
+            const denialAnswer = (result) => `⚠️ [proxy] ${buildPermissionError(role, result.permissionClass, result.permissionTarget, result.settingsPath, result.permissionLabel)} Ponowienie z informacją o blokadzie też trafiło na odmowę, więc zadanie nie zostało wykonane.`;
             const startedAt = Date.now();
             let firstByteAt = 0;
             console.log(`→ agy | stream=${isStream} | rola=${role} | model=${modelName} → agy:${agyModel || '(domyślny)'} | prompt=${prompt.length} zn. | "${prompt.substring(0, 80).replace(/\n/g, ' ')}..."`);
@@ -526,14 +1427,20 @@ const server = http.createServer((req, res) => {
             // attempt is currently running.
             let currentChild = null;
             let clientGone = false;
+            // Declared out here, not in the streaming branch, so the disconnect
+            // handler below can stop it at once. Its own guard is not enough:
+            // after a client abort `res.writableEnded` stays FALSE (verified —
+            // only `res.destroyed` flips), so the interval would keep firing and
+            // writing into a dead socket until agy's process finally exits.
+            let heartbeat = null;
             // Concurrency slot: `queueWaiter` is set only while this request is
             // parked in the queue; `heldRelease` is set only once it actually
             // holds a slot. freeSlot() releases exactly once (idempotent) and is
             // called on every terminal path — success, error, timeout, disconnect.
             let queueWaiter = null;
             let heldRelease = null;
-            const holdSlot = (release) => { heldRelease = release; roleActive[role]++; };
-            const freeSlot = () => { if (heldRelease) { const r = heldRelease; heldRelease = null; roleActive[role]--; r(); } };
+            const holdSlot = (release) => { heldRelease = release; roleActive[role] = (roleActive[role] || 0) + 1; };
+            const freeSlot = () => { if (heldRelease) { const r = heldRelease; heldRelease = null; roleActive[role] = Math.max(0, (roleActive[role] || 0) - 1); r(); } };
             // Kill agy together with its whole process group (detached spawn):
             // grandchildren (tool commands, xdg-open/browser) would otherwise
             // survive and keep the stdio pipes open forever.
@@ -544,6 +1451,7 @@ const server = http.createServer((req, res) => {
             };
             res.on('close', () => {
                 clientGone = true;
+                if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
                 if (currentChild && currentChild.exitCode === null && currentChild.signalCode === null) {
                     killTree(currentChild);
                 }
@@ -566,9 +1474,18 @@ const server = http.createServer((req, res) => {
                 let errOut = "";
                 let timedOut = false;   // false | 'idle' | 'hard' | 'stuck'
                 let spawnErr = null;
+                let quotaExhausted = null;   // { resetMs } once a fail-fast-worthy quota line is seen
                 let done = false;
+                let reapedAfterShutdown = false;   // we killed a hung-at-exit agy: its kill code means success
                 let rounds = 0;
+                // Trajectory-DB progress signal: path resolves once the glog names
+                // the conversation, then each poll reports rows appended since.
+                let convDb = null;
+                let lastStepIdx = -1;
+                let lastStepAt = 0;
+                const T = timeoutsFor(agyModel);
                 let lastActivityAt = Date.now();
+                const parser = AGY_STREAM_JSON ? createAgyStreamParser({ onText: (s) => onText(s) }) : null;
                 // Real progress = a model round or a stdout byte. Distinct from
                 // lastActivityAt (which a live tool child also refreshes): a tool
                 // child only keeps the run alive for TOOL_GRACE_MS past this.
@@ -589,12 +1506,23 @@ const server = http.createServer((req, res) => {
                 // settings.json allowlist is authoritative (see ROLES).
                 const agyArgs = [...roleCfg.args, '--print-timeout', AGY_PRINT_TIMEOUT, '--log-file', logFile];
                 if (agyModel) agyArgs.push('--model', agyModel);
+                if (AGY_STREAM_JSON) agyArgs.push('--output-format', 'stream-json');
+                if (role === 'dev' && devCtx) agyArgs.push('--add-dir', devCtx.worktreeRoot);
                 agyArgs.push('--print', prompt);
                 const spawnEnv = { ...process.env, NO_COLOR: '1' };
-                if (roleCfg.home) spawnEnv.HOME = roleCfg.home;   // isolated RO profile
+                for (const k of PC_ENV_KEYS) delete spawnEnv[k];
+                for (const k of DEV_ENV_KEYS) delete spawnEnv[k];
+                if (pcEnv) Object.assign(spawnEnv, pcEnv);   // for mcp/paperclip.js
+                if (role === 'dev' && devCtx) {
+                    spawnEnv.DEV_WORKTREE_ROOT = devCtx.worktreeRoot;
+                    spawnEnv.DEV_ISSUE_KEY = devCtx.issueKey;
+                }
+                const effectiveHome = role === 'dev' ? (process.env.AGY_DEV_HOME || roleCfg.home) : roleCfg.home;
+                if (effectiveHome) spawnEnv.HOME = effectiveHome;   // isolated ro / ops / dev profile
                 // detached: own process group, so a timeout kill also reaps
                 // grandchildren agy may spawn (tools, xdg-open, browsers).
-                const child = spawn('agy', agyArgs, {
+                const child = spawn(process.env.AGY_BIN || 'agy', agyArgs, {
+                    cwd: (role === 'dev' && devCtx) ? devCtx.worktreeRoot : undefined,
                     stdio: ['ignore', 'pipe', 'pipe'],
                     detached: true,
                     env: spawnEnv
@@ -609,6 +1537,30 @@ const server = http.createServer((req, res) => {
                     lastActivityAt = Date.now();
                     lastRealActivityAt = lastActivityAt;
                     if (onStatus) onStatus({ type: 'round', rounds });
+                }, (resetMs) => {
+                    // Quota exhausted far enough out that agy's own internal
+                    // retry loop can't help — kill now instead of holding the
+                    // slot for its full ~15-25 min backoff dance.
+                    quotaExhausted = { resetMs };
+                    console.log(`⏱ agy QUOTA wyczerpana po ${elapsed()}s — reset za ${fmtDuration(resetMs)}, zabijam zamiast czekać na wewnętrzny retry agy`);
+                    clearInterval(watchdog);
+                    killTree(child);
+                    setTimeout(() => finish(-1), 2000).unref();
+                }, (convId) => {
+                    convDb = convDbPath(roleCfg.home || process.env.HOME, convId);
+                    lastStepIdx = -1;   // new conversation: re-read its steps from the start
+                }, () => {
+                    // Conversation over; agy should exit within seconds. If it
+                    // hangs instead (see EXIT_GRACE_MS), reap it and finish as a
+                    // clean exit — finish() still flags a run with no output.
+                    setTimeout(() => {
+                        if (done) return;
+                        console.log(`⏱ agy nie wyszedł ${EXIT_GRACE_MS / 1000}s po zakończeniu rozmowy (po ${elapsed()}s) — zawis przy zamykaniu, ubijam grupę i kończę run`);
+                        reapedAfterShutdown = true;
+                        clearInterval(watchdog);
+                        killTree(child);
+                        setTimeout(() => finish(0), 1000).unref();
+                    }, EXIT_GRACE_MS).unref();
                 });
 
                 // Adaptive timeout. Flat 12-min kill used to cut off tasks agy
@@ -626,34 +1578,77 @@ const server = http.createServer((req, res) => {
                     // progress, so a wedged/runaway child (e.g. find stuck in NFS)
                     // can't mask the detectors forever. Computed once and reused
                     // by both the idle refresh and the stuck check.
-                    const toolActive = (now - lastRealActivityAt < TOOL_GRACE_MS)
-                        && child.pid && hasActiveToolChild(child.pid);
+                    const tool = (now - lastRealActivityAt < TOOL_GRACE_MS) && child.pid
+                        ? hasActiveToolChild(child.pid)
+                        : { active: false, comm: null, descendants: [] };
+                    // A tool that BLOCKS is invisible to every other signal at once.
+                    // Measured live (2026-09-15, `sleep 200` through run_command):
+                    // the glog went quiet, the trajectory appended no row for 100s+,
+                    // and /proc showed only `bash` + `sleep` in state S, so the R/D
+                    // check never fired and the run died as STUCK mid-tool.
+                    // The discriminator is the process GROUP: agy starts every tool in
+                    // a NEW group (setpgid/setsid), so a tool child LEADS its own group
+                    // (pgrp == pid), while agy's internal helpers and the long-lived MCP
+                    // servers stay in their parent's group (measured: mcp-nextcloud-rag
+                    // pid 1074616, pgrp 1074609). A descendant leading its own group is
+                    // therefore a tool agy is waiting on, whatever its state, and an idle
+                    // MCP server never matches — so it cannot mask the detectors (the old
+                    // bug that rode every wedged run to HARD). This is the exact inverse
+                    // of the original, broken check, which compared a child's pgrp to
+                    // AGY's pid and so never matched anything. Still gated by
+                    // TOOL_GRACE_MS, so even a permanently wedged tool is bounded.
+                    const spawnedTool = tool.descendants.find(d => d.pgrp === d.pid) || null;
+                    const toolActive = tool.active || !!spawnedTool;
+                    // Prefer the busy child's name; fall back to the blocked one, so the
+                    // status line can still say what agy is waiting on.
+                    const toolComm = tool.comm || (spawnedTool ? spawnedTool.comm : null);
                     if (now - lastActivityAt >= WATCHDOG_MS && toolActive) {
                         lastActivityAt = now;
                     }
+                    // Rows appended to agy's trajectory since the last tick are the
+                    // authoritative progress signal: they capture sub-second tool
+                    // calls that the /proc sampler above structurally misses.
+                    const newSteps = convDb ? readNewSteps(convDb, lastStepIdx) : [];
+                    if (newSteps.length) {
+                        lastStepIdx = newSteps[newSteps.length - 1].idx;
+                        lastStepAt = now;
+                        lastActivityAt = now;
+                        lastRealActivityAt = now;
+                    }
+                    // What to show the user. agy writes its own human-readable
+                    // label per step ("Reading WATCHDOG.md", "Sending canary
+                    // message") — always better than our guess from a process
+                    // name, and it also covers tools that spawn no process at all
+                    // (file reads), which /proc can never see. Fall back to the
+                    // process-name category only when no labelled step is new.
+                    const labelled = [...newSteps].reverse().find(s => s.label);
+                    if (onStatus && (labelled || toolActive)) {
+                        onStatus({ type: 'tool', label: labelled ? labelled.label : classifyTool(toolComm) });
+                    }
+                    const stepsRecent = lastStepAt > 0 && (now - lastStepAt) < STEP_PROGRESS_WINDOW_MS;
                     const idle = now - lastActivityAt;
-                    if (!firstByteAt && rounds >= STUCK_MIN_ROUNDS && total >= STUCK_NO_OUTPUT_MS
-                        && !toolActive) {
+                    if (!firstByteAt && rounds >= STUCK_MIN_ROUNDS && total >= T.stuck
+                        && !toolActive && !stepsRecent) {
                         timedOut = 'stuck';
-                        console.log(`⏱ agy STUCK po ${elapsed()}s — ${rounds} rund modelu, 0 tokenów odpowiedzi, brak żywego narzędzia; pętla bez postępu, zabijam`);
+                        console.log(`⏱ agy STUCK po ${elapsed()}s — ${rounds} rund modelu, 0 tokenów odpowiedzi, brak żywego narzędzia i brak nowych kroków trajektorii od ${Math.round(STEP_PROGRESS_WINDOW_MS / 1000)}s (kroków łącznie: ${lastStepIdx + 1}); pętla bez postępu, zabijam`);
                         clearInterval(watchdog);
                         killTree(child);
                         setTimeout(() => finish(-1), 5000).unref();
-                    } else if (total >= HARD_TIMEOUT_MS) {
+                    } else if (total >= T.hard) {
                         timedOut = 'hard';
-                        console.log(`⏱ agy HARD timeout (${HARD_TIMEOUT_MS / 60000} min) po ${elapsed()}s — zabijam proces (rund: ${rounds})`);
+                        console.log(`⏱ agy HARD timeout (${T.hard / 60000} min) po ${elapsed()}s — zabijam proces (rund: ${rounds})`);
                         clearInterval(watchdog);
                         killTree(child);
                         setTimeout(() => finish(-1), 5000).unref();
-                    } else if (idle >= IDLE_TIMEOUT_MS) {
+                    } else if (idle >= T.idle) {
                         timedOut = 'idle';
-                        console.log(`⏱ agy IDLE timeout (${IDLE_TIMEOUT_MS / 60000} min bez aktywności) po ${elapsed()}s — zabijam proces (rund: ${rounds})`);
+                        console.log(`⏱ agy IDLE timeout (${T.idle / 60000} min bez aktywności) po ${elapsed()}s — zabijam proces (rund: ${rounds})`);
                         clearInterval(watchdog);
                         killTree(child);
                         setTimeout(() => finish(-1), 5000).unref();
-                    } else if (total >= SOFT_TIMEOUT_MS && !extendedNotified) {
+                    } else if (total >= T.soft && !extendedNotified) {
                         extendedNotified = true;
-                        console.log(`⏱ SOFT limit (${SOFT_TIMEOUT_MS / 60000} min) minięty po ${elapsed()}s, agy aktywny (rund: ${rounds}) — przedłużam do max ${HARD_TIMEOUT_MS / 60000} min`);
+                        console.log(`⏱ SOFT limit (${T.soft / 60000} min) minięty po ${elapsed()}s, agy aktywny (rund: ${rounds}) — przedłużam do max ${T.hard / 60000} min`);
                         if (onStatus) onStatus({ type: 'extended', rounds });
                     }
                 }, WATCHDOG_MS);
@@ -667,16 +1662,42 @@ const server = http.createServer((req, res) => {
                     let logText = '';
                     try { logText = fs.readFileSync(logFile, 'utf8'); } catch (e) {}
                     try { logErr = extractAgyError(logText); } catch (e) {}
+                    if (parser) { try { parser.end(); } catch (e) {} }
+                    const notices = parser ? parser.notices : '';
+                    // agy can exit within seconds with only "Individual quota reached.
+                    // ... Resets in 1h9m1s." on stderr, before the log watcher sees a
+                    // RESOURCE_EXHAUSTED line (29.10: claude-sonnet-web, 2 runs). Without
+                    // this the client got a generic error, and OpenClaw retried the same
+                    // model and ended the run instead of moving down the fallback chain.
+                    if (!quotaExhausted) {
+                        const qm = `${errOut}\n${notices}\n${logText}`.match(/(?:quota reached|RESOURCE_EXHAUSTED)[^\n]*?Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/i);
+                        if (qm && (qm[1] || qm[2] || qm[3])) {
+                            const resetMs = ((parseInt(qm[1] || 0, 10) * 60 + parseInt(qm[2] || 0, 10)) * 60 + parseInt(qm[3] || 0, 10)) * 1000;
+                            if (resetMs >= QUOTA_FAIL_FAST_MS) {
+                                quotaExhausted = { resetMs };
+                                console.log(`⏱ agy QUOTA (stderr) — reset za ${fmtDuration(resetMs)}`);
+                            }
+                        }
+                    }
                     // Permission denial is its own failure mode: agy auto-denies a
                     // tool whose permission class is not on the role's allowlist.
                     // classifyDenial gets the class (+ target, when the glog logged
                     // it) from text we already hold. settingsPath points the
                     // operator at the exact allowlist to edit for this role.
-                    const denial = classifyDenial(logText, errOut, out);
+                    const denial = classifyDenial(logText, `${errOut}\n${notices}`, out);
                     const permissionClass = denial ? denial.permClass : null;
-                    let permissionTarget = null, settingsPath = null;
+                    let permissionTarget = null, settingsPath = null, permissionLabel = null;
                     if (denial) {
                         permissionTarget = denial.target;
+                        // The glog names the tool but usually not what it tried to
+                        // touch; the trajectory row has the exact command/path.
+                        if (!permissionTarget && convDb) {
+                            const detail = readDenialDetail(convDb, denial.stepIdx);
+                            if (detail) {
+                                permissionTarget = detail.target;
+                                permissionLabel = detail.label;
+                            }
+                        }
                         const agyHome = (roleCfg && roleCfg.home) || process.env.HOME || os.homedir();
                         settingsPath = path.join(agyHome, '.gemini/antigravity-cli/settings.json');
                     }
@@ -686,11 +1707,12 @@ const server = http.createServer((req, res) => {
                     // before. Prefix encodes the cause for later triage.
                     const hadOutput = !!firstByteAt;
                     let errKind = null;
-                    if (timedOut)               errKind = 'timeout';
-                    else if (spawnErr)          errKind = 'fail';
-                    else if (permissionClass)   errKind = 'denied';
-                    else if (code !== 0)        errKind = 'fail';
-                    else if (!hadOutput)        errKind = 'fail'; // clean exit, empty output
+                    if (quotaExhausted)          errKind = 'quota';
+                    else if (timedOut)           errKind = 'timeout';
+                    else if (spawnErr)           errKind = 'fail';
+                    else if (permissionClass)    errKind = 'denied';
+                    else if (code !== 0)         errKind = 'fail';
+                    else if (!hadOutput)         errKind = 'fail'; // clean exit, empty output
                     let savedGlog = null;
                     if (errKind && logText) {
                         savedGlog = path.join(os.tmpdir(), `agy-${errKind}-${process.pid}-${Date.now()}.log`);
@@ -699,18 +1721,27 @@ const server = http.createServer((req, res) => {
                         console.log(`⛏ agy ${errKind} glog zachowany: ${savedGlog}\n----- ogon glog -----\n${tail}\n----- koniec -----`);
                     }
                     try { fs.unlinkSync(logFile); } catch (e) {}
-                    cb({ code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath, savedGlog });
+                    let usage = null;
+                    if (parser) { try { usage = parser.usage(); } catch (e) {} }
+                    cb({ code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath, permissionLabel, savedGlog, quotaExhausted, T, steps: lastStepIdx + 1, usage });
                 };
 
-                child.stdout.on('data', (c) => {
-                    const s = c.toString();
-                    lastActivityAt = Date.now();
-                    lastRealActivityAt = lastActivityAt;
+                // Answer text. In stream-json mode only text_delta fields reach
+                // here, so firstByteAt (TTFT, stuck detector, "had output")
+                // still means real answer text, not the init event.
+                const onText = (s) => {
                     if (!firstByteAt) {
                         firstByteAt = Date.now();
                         console.log(`  ↳ pierwszy token po ${elapsed()}s`);
                     }
                     if (onChunk) onChunk(s); else out += s;
+                };
+                const stdoutDecoder = new StringDecoder('utf8');
+                child.stdout.on('data', (c) => {
+                    const s = stdoutDecoder.write(c);
+                    lastActivityAt = Date.now();
+                    lastRealActivityAt = lastActivityAt;
+                    if (parser) parser.push(s); else if (s) onText(s);
                 });
                 child.stderr.on('data', (c) => {
                     errOut += c.toString();
@@ -724,7 +1755,7 @@ const server = http.createServer((req, res) => {
                 // via xdg-open) can hold it open forever — watchdog then spams
                 // kills for hours. 'exit' fires as soon as agy itself dies;
                 // a short delay lets already-buffered stdout flush first.
-                child.on('exit', (code) => setTimeout(() => finish(code), 250));
+                child.on('exit', (code) => setTimeout(() => finish(reapedAfterShutdown ? 0 : code), 250));
             }
 
             const requestId = `chatcmpl-${Date.now()}`;
@@ -740,9 +1771,15 @@ const server = http.createServer((req, res) => {
                 })}\n\n`);
             }
 
-            function finalLog(code, rounds) {
+            // outcome: ok | limit | error | timeout | denied (pool state, DOM-30).
+            function finalLog(code, rounds, steps, outcome = 'ok', quotaResetMs = null) {
                 const ttft = firstByteAt ? ((firstByteAt - startedAt) / 1000).toFixed(2) : 'n/a';
-                console.log(`← agy zakończone | kod=${code} | całość=${elapsed()}s | TTFT=${ttft}s | rund=${rounds ?? '?'}`);
+                console.log(`← agy zakończone | kod=${code} | całość=${elapsed()}s | TTFT=${ttft}s | rund=${rounds ?? '?'} | kroków=${steps ?? '?'}`);
+                if (pools) {
+                    const pool = agyPoolFor(agyModel);
+                    if (outcome === 'limit') pools.quota(pool, quotaResetMs);
+                    pools.run({ requested: modelName, actual: agyModel, pool, outcome, code: Number.isInteger(code) ? code : null });
+                }
             }
 
             if (isStream) {
@@ -754,6 +1791,7 @@ const server = http.createServer((req, res) => {
                 res.setHeader('Connection', 'keep-alive');
 
                 let sentAny = false;
+                let fullOut = '';   // mirrors `out` in the buffered path; onChunk below never touches `out` itself (see runAgy), so the sentinel check needs its own accumulator
 
                 // Visible progress while agy is silent. agy --print emits
                 // nothing on stdout until the very end of heavy tasks, so the
@@ -770,6 +1808,7 @@ const server = http.createServer((req, res) => {
                 // output begins.
                 let lastVisibleAt = 0;
                 let lastShownRounds = 0;
+                let lastShownTool = null;
                 const elapsedMin = () => Math.max(1, Math.round((Date.now() - startedAt) / 60000));
 
                 const showStatus = (text) => {
@@ -778,7 +1817,7 @@ const server = http.createServer((req, res) => {
                     lastVisibleAt = Date.now();
                 };
 
-                const heartbeat = setInterval(() => {
+                heartbeat = setInterval(() => {
                     if (res.writableEnded || sentAny) return;
                     // Still parked in the queue: keep the client's stall detector
                     // fed (it aborts after ~400s of no stream progress) with a
@@ -811,6 +1850,11 @@ const server = http.createServer((req, res) => {
                     }
                 }, HEARTBEAT_MS);
 
+                // Latest step label agy reported but that hasn't been rendered yet.
+                // Round ticks arrive far more often than trajectory labels, so
+                // without this the generic "runda N" would always win the
+                // rationing window and the informative line would never show.
+                let pendingTool = null;
                 const onStatus = (ev) => {
                     if (ev.type === 'extended') {
                         showStatus(`⏳ [${elapsedMin()} min] agy wciąż aktywnie pracuje (runda ${ev.rounds}) — przedłużam limit czasu…\n`);
@@ -819,22 +1863,48 @@ const server = http.createServer((req, res) => {
                         && lastVisibleAt
                         && Date.now() - lastVisibleAt >= STATUS_MIN_GAP_MS) {
                         lastShownRounds = ev.rounds;
-                        showStatus(`⏳ [${elapsedMin()} min] agy pracuje — runda ${ev.rounds} zapytań do modelu…\n`);
+                        if (pendingTool) {   // a concrete step beats a bare round counter
+                            const label = pendingTool;
+                            pendingTool = null;
+                            lastShownTool = label;
+                            showStatus(`⏳ [${elapsedMin()} min] agy ${label.replace(/\s+/g, ' ').trim().slice(0, 80)}…\n`);
+                        } else {
+                            showStatus(`⏳ [${elapsedMin()} min] agy pracuje — runda ${ev.rounds} zapytań do modelu…\n`);
+                        }
+                    } else if (ev.type === 'tool' && ev.label && ev.label !== lastShownTool
+                        && !(lastVisibleAt && Date.now() - lastVisibleAt >= STATUS_MIN_GAP_MS)) {
+                        pendingTool = ev.label;   // too soon to render — remember it for the next window
+                    } else if (ev.type === 'tool'
+                        && ev.label
+                        && ev.label !== lastShownTool
+                        && lastVisibleAt
+                        && Date.now() - lastVisibleAt >= STATUS_MIN_GAP_MS) {
+                        // What agy is doing, from its own per-step label when the
+                        // trajectory has one, else the coarse process-name category.
+                        // Neither is raw argv: classifyTool reads only the binary
+                        // name, and the label is agy's own short summary of the
+                        // step — the same voice as the answer this user already
+                        // receives, so it adds no exposure a command line would.
+                        // Still normalised before rendering: one line, bounded.
+                        lastShownTool = ev.label;
+                        pendingTool = null;
+                        const shown = ev.label.replace(/\s+/g, ' ').trim().slice(0, 80);
+                        showStatus(`⏳ [${elapsedMin()} min] agy ${shown}…\n`);
                     }
                 };
 
                 const streamAttempt = (n) => {
                     runAgy(
-                        (chunk) => { sentAny = true; sendDelta(chunk); },
+                        (chunk) => { sentAny = true; fullOut += chunk; sendDelta(chunk); },
                         (result) => {
                             if (clientGone) { clearInterval(heartbeat); freeSlot(); return; }
-                            const { code, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath } = result;
-                            // Permission denial: a distinct, DETERMINISTIC failure —
-                            // agy auto-denied a tool not on the role's allowlist.
-                            // Never retried (a retry re-denies, wasting a spawn), and
-                            // surfaced as an ERROR event, not a content delta: a
-                            // content delta is exactly what made OpenClaw read the
-                            // failed run as a success.
+                            const { code, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath, permissionLabel, quotaExhausted, T } = result;
+                            // Permission denial: a distinct, DETERMINISTIC failure for
+                            // read_file/mcp when a required resource is missing from the
+                            // allowlist. Exception: in the 'ro' role RO_COMMANDS=() is
+                            // empty by design (shell is forbidden), so a 'command' denial
+                            // in 'ro' is a stochastic model hallucination (2x in 501 runs:
+                            // 12.10 23:01, 20.10 03:01) that succeeds on a single retry.
                             const permissionDenied = !!permissionClass && !sentAny;
                             // IDLE is retried like a transient failure: it fires on a
                             // genuinely stalled model call (network hang), and retrying
@@ -842,32 +1912,46 @@ const server = http.createServer((req, res) => {
                             // beats surfacing an error and letting OpenClaw re-run the whole
                             // turn externally (which doubled the wait, see STUCK comment
                             // above). HARD and STUCK stay authoritative/non-retried.
-                            // Explicitly excludes a denial (code is 0 there anyway).
-                            const transientFail = !spawnErr && !permissionDenied && (!timedOut || timedOut === 'idle') && code !== 0;
+                            // Explicitly excludes a denial (code is 0 there anyway) and a
+                            // quota kill (retrying hits the same exhausted quota).
+                            const transientFail = !spawnErr && !permissionDenied && !quotaExhausted && (!timedOut || timedOut === 'idle') && code !== 0;
                             // agy >= 1.1.0 error signature: clean exit, zero
                             // output. The real cause sits in logErr. Not
                             // retried: the dominant case (quota 429) won't
                             // clear on retry and OpenClaw retries once anyway.
-                            const emptyFail = !spawnErr && !permissionDenied && !timedOut && code === 0 && !sentAny;
+                            const emptyFail = !spawnErr && !permissionDenied && !quotaExhausted && !timedOut && code === 0 && !sentAny;
 
-                            if (transientFail && !sentAny && n < MAX_ATTEMPTS) {
-                                console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
-                                return streamAttempt(n + 1);
+                            if ((transientFail || permissionDenied) && !sentAny && n < MAX_ATTEMPTS) {
+                                if (permissionDenied) addDenialHint(result);
+                                console.log(`↻ agy próba ${n} nieudana (${permissionDenied ? `odmowa ${permissionClass}("${permissionTarget || '?'}") w roli ${role}, ponawiam z informacją o blokadzie` : `kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}`}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
+                                return retryAfterUnknownModel(result, () => streamAttempt(n + 1));
                             }
 
                             clearInterval(heartbeat);
-                            if (permissionDenied) {
-                                const full = buildPermissionError(role, permissionClass, permissionTarget, settingsPath);
-                                console.error(`✗ [odmowa uprawnienia] ${full}`);
-                                // OpenAI-style error event — NOT a content delta, and
-                                // NOT a finish_reason:'stop' delta. The 200 headers
-                                // already went out (heartbeat starts before the slot),
-                                // so the status can't change; the error object is the
-                                // only in-band way to signal a failed turn.
-                                res.write(`data: ${JSON.stringify({ error: { message: full, type: 'agy_error', code: 'permission_denied', permission: permissionClass, role } })}\n\n`);
+                            if (quotaExhausted) {
+                                const full = quotaMessage(modelName, quotaExhausted.resetMs);
+                                console.error(`✗ [kwota] ${full}`);
+                                res.write(`data: ${JSON.stringify({ error: { message: full, type: 'agy_error', code: 'quota_exhausted', status: 429, role, resetMs: quotaExhausted.resetMs } })}\n\n`);
                                 res.write('data: [DONE]\n\n');
                                 res.end();
-                                finalLog(code, rounds);
+                                finalLog(code, rounds, result.steps, 'limit', quotaExhausted.resetMs);
+                                freeSlot();
+                                return;
+                            }
+                            if (permissionDenied) {
+                                // Second denial in a row (the retry above already told
+                                // the model). Returned as a normal answer on purpose:
+                                // an error event makes OpenClaw retry ~4x per model and
+                                // walk the fallback chain, and every model there has the
+                                // same role, so they all hit the same wall. The ⚠️ text
+                                // still reaches the caller (and a cron's channel).
+                                const full = denialAnswer(result);
+                                console.error(`✗ [odmowa uprawnienia, 2. raz — zwracam jako odpowiedź] ${full}`);
+                                sendDelta(full);
+                                sendDelta(null, 'stop');
+                                res.write('data: [DONE]\n\n');
+                                res.end();
+                                finalLog(code, rounds, result.steps, 'denied');
                                 freeSlot();
                                 return;
                             }
@@ -875,24 +1959,57 @@ const server = http.createServer((req, res) => {
                                 const msg = spawnErr
                                     ? `Nie udało się uruchomić agy: ${spawnErr.message}`
                                     : timedOut === 'stuck'
-                                        ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
+                                        ? `agy utknął bez pierwszego tokenu — ${rounds} rund do modelu i zero odpowiedzi przez ${mins(T.stuck)} min, bez żywego narzędzia i bez nowych kroków trajektorii. Możliwa pętla (brak narzędzia/uprawnienia) — sprawdź glog i rozważ AGY_STUCK_MS. Przerwane.`
                                     : timedOut === 'idle'
-                                        ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
+                                        ? `agy przerwany — brak aktywności przez ${T.idle / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                         : timedOut === 'hard'
-                                            ? `Przekroczono absolutny limit czasu (${HARD_TIMEOUT_MS / 60000} min, rund: ${rounds})`
+                                            ? `Przekroczono absolutny limit czasu (${T.hard / 60000} min, rund: ${rounds})`
                                             : code !== 0
                                                 ? `agy zakończył się błędem (kod ${code})`
                                                 : `agy nie zwrócił treści`;
                                 const detail = summarizeAgyError(logErr) || errOut.trim().slice(0, 300) || null;
                                 const full = detail ? `${msg}: ${detail}` : msg;
                                 console.error(`✗ ${full}`);
-                                sendDelta(`\n⚠️ [proxy] ${full}`, 'stop');
+                                // Error EVENT, not a content delta — same reason as the
+                                // permission branch above. A delta with finish_reason:'stop'
+                                // is indistinguishable from a normal answer upstream, so
+                                // every failure here was booked as a successful turn.
+                                // Measured cost, 2026-08-07 11:07: a STUCK kill (28 rounds,
+                                // zero output, 420s) was written to cron history as
+                                // `status = ok`, consecutiveErrors stayed 0 and failureAlert
+                                // never fired — one hour of HA monitoring vanished and the
+                                // ⚠️ text was delivered to the channel as if it were the
+                                // watchdog's report. Known trade-off: OpenClaw retries an
+                                // error object ~4x, so a genuinely stuck run now costs
+                                // several attempts instead of one. Capping that belongs to
+                                // the cron/gateway config, not here — a silent success is
+                                // the worse failure mode.
+                                res.write(`data: ${JSON.stringify({ error: { message: full, type: 'agy_error', code: failureCode({ spawnErr, timedOut, code, emptyFail }), role } })}\n\n`);
                             } else {
+                                // Which model actually answered — agyModel is the
+                                // resolved Antigravity display name (e.g. "Gemini
+                                // 3.1 Pro (High)"); modelName is the raw id when
+                                // agyModel is null (unset AGY_MODEL default).
+                                // Skip our own footer for exact-match control sentinels
+                                // (NO_REPLY, HEARTBEAT_OK, ...) — appending it breaks the
+                                // byte-exact comparison OpenClaw's suppression logic does.
+                                // Free-form reports still get the footer; it's harmless there.
+                                if (!isControlSentinel(fullOut)) {
+                                    sendDelta(`\n\n— model: ${footerModel(agyModel || modelName, resolved.id)}`);
+                                }
                                 sendDelta(null, 'stop');
+                                // Token usage (stream-json mode): same final chunk
+                                // shape as the cc proxy, for OpenClaw's context ring.
+                                if (result.usage) {
+                                    res.write(`data: ${JSON.stringify({
+                                        id: requestId, object: "chat.completion.chunk", created: createdTime, model: modelName,
+                                        choices: [], usage: result.usage
+                                    })}\n\n`);
+                                }
                             }
                             res.write('data: [DONE]\n\n');
                             res.end();
-                            finalLog(code, rounds);
+                            finalLog(code, rounds, result.steps, (spawnErr || timedOut || code !== 0 || emptyFail) ? (timedOut ? 'timeout' : 'error') : 'ok');
                             freeSlot();
                         },
                         onStatus
@@ -934,31 +2051,51 @@ const server = http.createServer((req, res) => {
                 const bufAttempt = (n) => {
                     runAgy(null, (result) => {
                         if (clientGone) { freeSlot(); return; }
-                        const { code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath } = result;
-                        // Permission denial: deterministic, never retried. Distinct
-                        // HTTP 403 + code permission_denied so the caller can tell it
-                        // apart from a transient failure and NOT retry it.
+                        const { code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath, permissionLabel, quotaExhausted, T } = result;
+                        // Permission denial: retried once with a hint for the model
+                        // (addDenialHint), then returned as a plain answer.
                         const permissionDenied = !!permissionClass && !out.trim();
                         // See streaming path above: IDLE is retried in-proxy (buffered mode
                         // never sent anything to the client mid-flight, so it's always safe).
-                        const transientFail = !spawnErr && !permissionDenied && (!timedOut || timedOut === 'idle') && code !== 0;
+                        // Excludes a quota kill too — retrying hits the same exhausted quota.
+                        const transientFail = !spawnErr && !permissionDenied && !quotaExhausted && (!timedOut || timedOut === 'idle') && code !== 0;
                         // Same empty-output error signature as in stream mode.
-                        const emptyFail = !spawnErr && !permissionDenied && !timedOut && code === 0 && !out.trim();
+                        const emptyFail = !spawnErr && !permissionDenied && !quotaExhausted && !timedOut && code === 0 && !out.trim();
 
-                        if (transientFail && n < MAX_ATTEMPTS) {
-                            console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
-                            return bufAttempt(n + 1);
+                        if ((transientFail || emptyFail || permissionDenied) && n < MAX_ATTEMPTS) {
+                            if (permissionDenied) addDenialHint(result);
+                            console.log(`↻ agy próba ${n} nieudana (${permissionDenied ? `odmowa ${permissionClass}("${permissionTarget || '?'}") w roli ${role}, ponawiam z informacją o blokadzie` : `kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}`}) — ponawiam w nowej sesji. stderr: ${errOut.trim().slice(0, 200)}`);
+                            return retryAfterUnknownModel(result, () => bufAttempt(n + 1));
                         }
 
                         if (res.writableEnded) return;
 
-                        if (permissionDenied) {
-                            const full = buildPermissionError(role, permissionClass, permissionTarget, settingsPath);
-                            console.error(`✗ [odmowa uprawnienia] ${full}`);
-                            res.statusCode = 403;
+                        if (quotaExhausted) {
+                            const full = quotaMessage(modelName, quotaExhausted.resetMs);
+                            console.error(`✗ [kwota] ${full}`);
+                            res.statusCode = 429;
+                            res.setHeader('Retry-After', String(Math.ceil(quotaExhausted.resetMs / 1000)));
                             res.setHeader('Content-Type', 'application/json');
-                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: 'permission_denied', permission: permissionClass, role } }));
-                            finalLog(code, rounds);
+                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: 'quota_exhausted', status: 429, role, resetMs: quotaExhausted.resetMs } }));
+                            finalLog(code, rounds, result.steps, 'limit', quotaExhausted.resetMs);
+                            freeSlot();
+                            return;
+                        }
+
+                        if (permissionDenied) {
+                            // Second denial: plain answer, not 403 (see stream path).
+                            const full = denialAnswer(result);
+                            console.error(`✗ [odmowa uprawnienia, 2. raz — zwracam jako odpowiedź] ${full}`);
+                            res.statusCode = 200;
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify({
+                                id: requestId,
+                                object: "chat.completion",
+                                created: createdTime,
+                                model: modelName,
+                                choices: [{ message: { role: "assistant", content: full }, finish_reason: "stop", index: 0 }]
+                            }));
+                            finalLog(code, rounds, result.steps, 'denied');
                             freeSlot();
                             return;
                         }
@@ -967,11 +2104,11 @@ const server = http.createServer((req, res) => {
                             const msg = spawnErr
                                 ? `Nie udało się uruchomić agy: ${spawnErr.message}`
                                 : timedOut === 'stuck'
-                                    ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
+                                    ? `agy utknął bez pierwszego tokenu — ${rounds} rund do modelu i zero odpowiedzi przez ${mins(T.stuck)} min, bez żywego narzędzia i bez nowych kroków trajektorii. Możliwa pętla (brak narzędzia/uprawnienia) — sprawdź glog i rozważ AGY_STUCK_MS. Przerwane.`
                                 : timedOut === 'idle'
-                                    ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
+                                    ? `agy przerwany — brak aktywności przez ${T.idle / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                     : timedOut === 'hard'
-                                        ? `Przekroczono absolutny limit czasu (${HARD_TIMEOUT_MS / 60000} min, rund: ${rounds})`
+                                        ? `Przekroczono absolutny limit czasu (${T.hard / 60000} min, rund: ${rounds})`
                                         : code !== 0
                                             ? `agy zakończył się błędem (kod ${code})`
                                             : `agy nie zwrócił treści`;
@@ -980,22 +2117,29 @@ const server = http.createServer((req, res) => {
                             console.error(`✗ ${full}`);
                             res.statusCode = spawnErr ? 502 : timedOut ? 504 : 500;
                             res.setHeader('Content-Type', 'application/json');
-                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: emptyFail ? 'empty_response' : 'agy_failed' } }));
-                            finalLog(code, rounds);
+                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: failureCode({ spawnErr, timedOut, code, emptyFail }), role } }));
+                            finalLog(code, rounds, result.steps, timedOut ? 'timeout' : 'error');
                             freeSlot();
                             return;
                         }
 
                         res.setHeader('Content-Type', 'application/json');
                         res.statusCode = 200;
+                        // See streaming path: don't corrupt an exact-match control
+                        // sentinel (NO_REPLY, ...) with our own footer.
+                        const trimmedOut = out.trim();
+                        const finalContent = isControlSentinel(trimmedOut)
+                            ? trimmedOut
+                            : `${trimmedOut}\n\n— model: ${footerModel(agyModel || modelName, resolved.id)}`;
                         res.end(JSON.stringify({
                             id: requestId,
                             object: "chat.completion",
                             created: createdTime,
                             model: modelName,
-                            choices: [{ message: { role: "assistant", content: out.trim() }, finish_reason: "stop", index: 0 }]
+                            choices: [{ message: { role: "assistant", content: finalContent }, finish_reason: "stop", index: 0 }],
+                            ...(result.usage ? { usage: result.usage } : {})
                         }));
-                        finalLog(code, rounds);
+                        finalLog(code, rounds, result.steps);
                         freeSlot();
                     });
                 };
@@ -1028,7 +2172,30 @@ const server = http.createServer((req, res) => {
                     }
                 });
             }
-        });
+        } catch (unhandledErr) {
+            if (!res.destroyed && !res.writableEnded) {
+                console.error(`✗ proxy nieobsłużony błąd zapytania: ${unhandledErr.message}`);
+                try {
+                    if (isStream) {
+                        res.setHeader('Content-Type', 'text/event-stream');
+                        res.write(`data: ${JSON.stringify({
+                            id: `chatcmpl-${Date.now()}`,
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: "antigravity",
+                            choices: [{ delta: { content: `⚠️ [proxy] Nieoczekiwany błąd serwera: ${unhandledErr.message}` }, index: 0, finish_reason: 'stop' }]
+                        })}\n\n`);
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                    } else {
+                        res.statusCode = 500;
+                        res.setHeader('Content-Type', 'application/json');
+                        res.end(JSON.stringify({ error: { message: `Nieoczekiwany błąd serwera proxy: ${unhandledErr.message}`, type: 'agy_error', code: 'internal_error' } }));
+                    }
+                } catch (_) {}
+            }
+        }
+    });
     } else {
         res.statusCode = 404;
         res.end("Not Found");
@@ -1045,7 +2212,14 @@ function sweepOldGlogs() {
     let removed = 0;
     try {
         for (const name of fs.readdirSync(dir)) {
-            if (!/^agy-(timeout|denied|fail)-.*\.log$/.test(name)) continue;
+            // Match ANY agy-<kind>- glog, not an enumerated prefix list. The
+            // old list was (timeout|denied|fail) and silently stopped sweeping
+            // when a prefix was renamed: on 2026-08-07 /tmp still held 23 files,
+            // oldest from 07-20 (18 days at a 7-day retention), all named
+            // agy-stuck-* / agy-bis-* from earlier proxy versions.
+            // Live per-request files (agy-proxy-*) are safe to include here:
+            // they can only be minutes old, and the mtime test below is days.
+            if (!/^agy-[a-z]+-.*\.log$/.test(name)) continue;
             const p = path.join(dir, name);
             try {
                 if (now - fs.statSync(p).mtimeMs > maxAgeMs) { fs.unlinkSync(p); removed++; }
@@ -1055,17 +2229,38 @@ function sweepOldGlogs() {
     if (removed) console.log(`⛏ sprzątanie: skasowano ${removed} zachowanych glogów starszych niż ${GLOG_RETENTION_DAYS} dni`);
 }
 
-server.listen(PORT, '127.0.0.1', () => {
-    console.log(`Lokalny serwer Proxy Node.js (live streaming + retry + telemetria) działa na porcie ${PORT}`);
-    sweepOldGlogs();
-});
-process.stdin.resume();
+if (require.main === module) {
+    server.listen(PORT, '127.0.0.1', () => {
+        console.log(`Lokalny serwer Proxy Node.js (live streaming + retry + telemetria) działa na porcie ${PORT}`);
+        sweepOldGlogs();
+        refreshModels('start');
+        setInterval(() => refreshModels('timer'), MODEL_REFRESH_MS).unref();
+    });
+    process.stdin.resume();
 
-server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} already in use – shutting down.`);
-    } else {
-        console.error('Server error:', err);
-    }
-    process.exit(1);
-});
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`Port ${PORT} already in use – shutting down.`);
+        } else {
+            console.error('Server error:', err);
+        }
+        process.exit(1);
+    });
+} else {
+    module.exports = {
+        server,
+        ROLES,
+        OPS_BUILD_SCRIPT,
+        DEV_BUILD_SCRIPT,
+        DEV_GUARD,
+        DEV_SANDBOX_MCP,
+        getApprovals,
+        _setApprovals,
+        getDevWorkspace,
+        _setDevWorkspace,
+        ensureDenyProfile,
+        ensureDevProfile,
+        buildDevPromptNote,
+        resolveAgyModel,
+    };
+}

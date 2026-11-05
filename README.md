@@ -176,3 +176,9 @@ Two gotchas that cost real debugging time:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Also in this repo
+
+- `claude_proxy.js` — the same OpenAI-compatible facade for the Claude Code CLI (`cc/*` models), with role profiles and quota-aware failover.
+- `plugins/clef-decision/` — OpenClaw decision-model provider backed by Cloudflare Workers AI CLEF (shares the daily neuron budget via `tools/clef_guard.js`).
+- `tools/` — modules the proxies load at runtime (usage/pool state, stream parser, quota errors) plus their tests (`node tools/test_*.js`).

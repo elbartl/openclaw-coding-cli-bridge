@@ -1,0 +1,42 @@
+{
+  "id": "clef-decision",
+  "name": "Cloudflare CLEF decisions",
+  "description": "Decision provider (decisionModel) backed by Cloudflare Workers AI @cf/cloudflare/clef. Shares the clef_guard daily neuron budget (free tier).",
+  "categories": ["other"],
+  "activation": { "onStartup": false },
+  "contracts": { "decisionProviders": ["clef"] },
+  "decisionModels": [
+    {
+      "provider": "clef",
+      "id": "clef",
+      "name": "Cloudflare CLEF",
+      "capabilities": {
+        "questionTypes": ["boolean", "choice", "score"],
+        "maxQuestions": 64,
+        "maxChoiceAlternatives": 255,
+        "maxScoreLevels": 10,
+        "confidence": "provider-specific"
+      }
+    },
+    {
+      "provider": "clef",
+      "id": "clef-flash",
+      "name": "Cloudflare CLEF Flash",
+      "capabilities": {
+        "questionTypes": ["boolean", "choice", "score"],
+        "maxQuestions": 64,
+        "maxChoiceAlternatives": 255,
+        "maxScoreLevels": 10,
+        "confidence": "provider-specific"
+      }
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dailyNeuronCap": { "type": "number", "minimum": 0, "maximum": 7000 },
+      "anonymize": { "type": "boolean" }
+    }
+  }
+}
