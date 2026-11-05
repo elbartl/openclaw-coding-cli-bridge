@@ -15,7 +15,7 @@ const readBudget = () => JSON.parse(fs.readFileSync(budgetFile(), 'utf8'));
 const { buildClefProvider, translateBatch } = await import('./provider.js');
 
 const BATCH = {
-    state: { message: 'Backup na serwer 192.168.0.50 nie powiódł się, bart.win' },
+    state: { message: 'Backup na serwer 192.168.0.50 nie powiódł się, mylab.example' },
     questions: {
         escalate: { type: 'boolean', instructions: 'Wake the user?', criteria: { true: 'Data loss risk', false: 'Routine' } },
         'route key!': { type: 'choice', criteria: { infra: 'Infra', backup: 'Backup' } },

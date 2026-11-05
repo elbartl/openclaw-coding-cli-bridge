@@ -53,7 +53,7 @@ const RO_ALLOW_FILE = process.env.CC_RO_ALLOW || path.join(CONFIG_DIR, 'ro-allow
 // auto-approves Bash commands Claude Code classifies as read-only (verified:
 // `echo hi` ran with --allowedTools Read), which would let RO `cat` anything.
 const RO_BUILTIN_TOOLS = process.env.CC_RO_TOOLS || 'Read,Glob,Grep,WebSearch,WebFetch';
-// Named project contexts: {"ha": {"dir": "/home/bl/projects/homeassistant",
+// Named project contexts: {"ha": {"dir": "/path/to/project",
 // "roDeny": ["Read(./config/secrets.yaml)"]}} (a bare string = just "dir").
 // Selected by a `:name` part of the model id (see resolveModel). The run then
 // starts in that directory, so Claude Code loads the project's CLAUDE.md.
@@ -84,7 +84,7 @@ const OPS_DENY_DEFAULT = [
 // web role (Paperclip researcher / security watcher): the internet and the
 // Paperclip bridge, nothing else. No file tools at all (--tools), no HA or
 // Nextcloud MCP (own --mcp-config with only `paperclip`), every fetch checked
-// by tools/web_guard.js (no LAN, no loopback, no bart.win). An agent that
+// by tools/web_guard.js (no LAN, no loopback, no own public domain). An agent that
 // reads untrusted pages must have nothing worth leaking and no way to act.
 const WEB_BUILTIN_TOOLS = 'WebSearch,WebFetch';
 const WEB_MCP_SERVERS = ['paperclip'];
@@ -259,7 +259,7 @@ function loadProjects() {
 
 // Setting sources differ by role on purpose. full loads the project's own
 // .claude/settings(.local).json (hooks, env — permissions are moot under
-// skip-permissions). ro must NOT: a project allowlist (e.g. homeassistant
+// skip-permissions). ro must NOT: a project allowlist (e.g. a home-automation project
 // allows ha_call_service and Bash(ssh *)) would silently widen the RO role.
 // CLAUDE.md is loaded from cwd either way (verified with --setting-sources "").
 // full/ops: PreToolUse hook that blocks whole-disk scans (`find /`, `grep -r x /`).
@@ -472,8 +472,8 @@ function isControlSentinel(text) {
 }
 function stripProgress(text) {
     return text
-        .replace(/\/home\/…HDOG\.md/g, '/home/bl/projects/homeassistant/WATCHDOG.md')
-        .replace(/\/home\/…TITY\.md/g, '/home/bl/projects/homeassistant/IDENTITY.md')
+        .replace(/\/home\/…HDOG\.md/g, (process.env.WATCHDOG_DIR || '/opt/workspace') + '/WATCHDOG.md')
+        .replace(/\/home\/…TITY\.md/g, (process.env.WATCHDOG_DIR || '/opt/workspace') + '/IDENTITY.md')
         .replace(/\r?[⏳⌛][^\r\n]*/g, '')
         .replace(/⚠️?\s*\[proxy\][^\r\n]*/g, '')
         .replace(/\n\n— model: [^\r\n]*$/, '')
@@ -941,8 +941,8 @@ const server = http.createServer((req, res) => {
                     issueKey = localKey;
                     allowLocal = true;
                 } else {
-                    console.error(`✗ rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.`);
-                    return jsonError(403, "Rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.", 'dev_requires_paperclip_issue');
+                    console.error(`✗ rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody właściciela.`);
+                    return jsonError(403, "Rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody właściciela.", 'dev_requires_paperclip_issue');
                 }
             }
             try {

@@ -112,11 +112,21 @@ function loadKey() {
 }
 
 // ---------- anonymisation ----------
+// Owner-specific patterns come from env (CLEF_OWN_DOMAIN, CLEF_OWN_NAME_PATTERN); unset = no-op.
+function escRe(x) { return x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function ownDomainRe() {
+    const d = process.env.CLEF_OWN_DOMAIN;
+    return d ? new RegExp('\\b((?:[a-z0-9-]+\\.)*)' + escRe(d) + '\\b', 'gi') : /(?!)/g;
+}
+function ownNameRe() {
+    const n = process.env.CLEF_OWN_NAME_PATTERN;
+    return n ? new RegExp(n, 'gi') : /(?!)/g;
+}
 function anonymize(s) {
     return String(s == null ? '' : s)
-        .replace(/\b((?:[a-z0-9-]+\.)*)bart\.win\b/gi, (m, sub) => (sub || '') + 'example.com')
+        .replace(ownDomainRe(), (m, sub) => (sub || '') + 'example.com')
         .replace(/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g, '198.51.100.1')
-        .replace(/laszczy\w*/gi, 'Kowalski');
+        .replace(ownNameRe(), 'Kowalski');
 }
 function truncReport(s) {
     if (s.length <= REPORT_MAX) return s;

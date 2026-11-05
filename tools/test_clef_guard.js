@@ -1,4 +1,5 @@
 'use strict';
+process.env.CLEF_OWN_DOMAIN = process.env.CLEF_OWN_DOMAIN || 'mylab.example'; process.env.CLEF_OWN_NAME_PATTERN = process.env.CLEF_OWN_NAME_PATTERN || 'smiths?\w*';
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -312,16 +313,16 @@ test('anonymisation: nothing private reaches the API', async () => {
     try {
         await guard.scanReport({
             runId: 'a',
-            task: 'Check ha.bart.win and Laszczyński 123456789',
-            report: 'Host bart.win, https://x.bart.win/p, 192.168.10.10, 10.1.2.3, 172.20.0.5, 127.0.0.1, Bart Laszczyński, id 123456789, 8.8.8.8',
+            task: 'Check ha.mylab.example and Smithson 123456789',
+            report: 'Host mylab.example, https://x.mylab.example/p, 192.168.10.10, 10.1.2.3, 172.20.0.5, 127.0.0.1, John Smithson, id 123456789, 8.8.8.8',
         });
         const s = t.mock.bodies[0].state;
-        for (const bad of ['bart.win', '192.168.', 'Laszczy', '10.1.2.3', '172.20.']) assert.ok(!s.includes(bad), bad);
+        for (const bad of ['mylab.example', '192.168.', 'Smiths', '10.1.2.3', '172.20.']) assert.ok(!s.includes(bad), bad);
         assert.ok(s.includes('ha.example.com') && s.includes('x.example.com') && s.includes('Kowalski') && s.includes('8.8.8.8'));
         assert.ok(s.includes('198.51.100.1'));
         // local state must not contain them either
         const st = fs.readFileSync(path.join(t.env.CLEF_STATE_DIR, 'budget.json'), 'utf8');
-        for (const bad of ['bart.win', '192.168.', 'Laszczy']) assert.ok(!st.includes(bad), 'state ' + bad);
+        for (const bad of ['mylab.example', '192.168.', 'Smiths']) assert.ok(!st.includes(bad), 'state ' + bad);
     } finally { await t.done(); }
 });
 

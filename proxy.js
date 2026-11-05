@@ -1071,8 +1071,8 @@ function isControlSentinel(text) {
 // OpenClaw >= 2026.10.4's AWS_SECRET_ACCESS_KEY_MATCHER (/home/…HDOG.md).
 function stripProgress(text) {
     return text
-        .replace(/\/home\/…HDOG\.md/g, '/home/bl/projects/homeassistant/WATCHDOG.md')
-        .replace(/\/home\/…TITY\.md/g, '/home/bl/projects/homeassistant/IDENTITY.md')
+        .replace(/\/home\/…HDOG\.md/g, (process.env.WATCHDOG_DIR || '/opt/workspace') + '/WATCHDOG.md')
+        .replace(/\/home\/…TITY\.md/g, (process.env.WATCHDOG_DIR || '/opt/workspace') + '/IDENTITY.md')
         .replace(/\r?[⏳⌛][^\r\n]*/g, '')
         .replace(/⚠️?\s*\[proxy\][^\r\n]*/g, '')
         .replace(/\n\n— model: [^\r\n]*$/, '') // our own "which model answered" footer
@@ -1359,10 +1359,10 @@ const server = http.createServer((req, res) => {
                         issueKey = localKey;
                         allowLocal = true;
                     } else {
-                        console.error(`✗ rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.`);
+                        console.error(`✗ rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody właściciela.`);
                         res.statusCode = 403;
                         res.setHeader('Content-Type', 'application/json');
-                        res.end(JSON.stringify({ error: { message: "Rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody Barta.", type: 'agy_error', code: 'dev_requires_paperclip_issue', role } }));
+                        res.end(JSON.stringify({ error: { message: "Rola 'dev' wymaga przebiegu z Paperclipa z zatwierdzoną kartą zgody właściciela.", type: 'agy_error', code: 'dev_requires_paperclip_issue', role } }));
                         return;
                     }
                 }

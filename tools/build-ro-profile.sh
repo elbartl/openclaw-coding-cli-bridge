@@ -17,7 +17,7 @@ set -euo pipefail
 
 SRC="${AGY_SRC_HOME:-$HOME}/.gemini"
 DEST="${AGY_RO_HOME:-$HOME/.agy-profiles/ro}/.gemini"
-WORKSPACE="${AGY_RO_WORKSPACE:-$HOME/projects/homeassistant}"
+WORKSPACE="${AGY_RO_WORKSPACE:-$HOME/workspace}"
 
 # Read-only allowlist. Names verified against the live ha-mcp server. Only
 # get_/list_/search/config_get_/config_list_ tools — every write/manage/remove/
@@ -50,7 +50,7 @@ RO_TOOLS=(
 # read-only over Home Assistant, not a confidentiality boundary with holes: the 25
 # MCP read tools above already cover the job, so the shell buys nothing but surface.
 # Keep this empty. If a shell is ever genuinely needed, use path-prefixed entries
-# (e.g. `command(cat ~/projects/homeassistant/config/)`) and note that `../`
+# (e.g. `command(cat ~/workspace/config/)`) and note that `../`
 # still defeats a prefix match.
 RO_COMMANDS=()
 
@@ -63,7 +63,7 @@ RO_COMMANDS=()
 # watchdog was reading ~21k tokens of full briefing 24x/day to execute a ~8k
 # checklist. AGENTS.md stays readable for the roster (ha-diag) during diagnosis.
 # ./WATCHDOG.md avoids OpenClaw 2026.10.4 AWS_SECRET_ACCESS_KEY_MATCHER false
-# positive on the 40-char base64-alphabet substring "/home/bl/projects/homeassistant/WATCHDOG".
+# positive on the 40-char base64-alphabet substring "<workspace>/WATCHDOG".
 RO_READ_FILES=(
   "$WORKSPACE/WATCHDOG.md"
   "$WORKSPACE/./WATCHDOG.md"
