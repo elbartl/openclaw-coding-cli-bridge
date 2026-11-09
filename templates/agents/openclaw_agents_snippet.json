@@ -1,0 +1,100 @@
+{
+  "master": {
+    "name": "master",
+    "description": "Koordynator i mistrz orkiestracji workflow DEV: dekompozycja zadań, zarządzanie sprawami, weryfikacja diffu i koordynacja wdrożenia po zgodzie człowieka.",
+    "workspace": "${OPENCLAW_WORKSPACE}/agents/master",
+    "agentDir": "${OPENCLAW_STATE}/agents/master/agent",
+    "heartbeat": {
+      "every": "0m"
+    },
+    "subagents": {
+      "allowAgents": [
+        "developer",
+        "tester",
+        "reviewer",
+        "executor"
+      ]
+    },
+    "model": {
+      "primary": "agy/gemini-flash-high-ops",
+      "fallbacks": [
+        "cc/claude-sonnet-ops",
+        "agy/claude-sonnet-ops",
+        "agy/gemini-pro-ops",
+        "agy/gemini-flash-ops"
+      ]
+    }
+  },
+  "developer": {
+    "name": "developer",
+    "description": "Programista (rola dev): implementacja zmian w kodzie źródłowym i testów jednostkowych w izolowanym git worktree.",
+    "workspace": "${OPENCLAW_WORKSPACE}/agents/developer",
+    "agentDir": "${OPENCLAW_STATE}/agents/developer/agent",
+    "heartbeat": {
+      "every": "0m"
+    },
+    "model": {
+      "primary": "agy/gemini-flash-high-dev",
+      "fallbacks": [
+        "agy/gemini-flash-dev",
+        "agy/claude-sonnet-dev",
+        "agy/gemini-argon-high-dev",
+        "agy/gemini-argon-dev"
+      ]
+    }
+  },
+  "tester": {
+    "name": "tester",
+    "description": "Tester kodu (rola dev): niezależny, adwersaryjny audyt kodu, testy brzegowe i wyścigi we wspólnym git worktree.",
+    "workspace": "${OPENCLAW_WORKSPACE}/agents/tester",
+    "agentDir": "${OPENCLAW_STATE}/agents/tester/agent",
+    "heartbeat": {
+      "every": "0m"
+    },
+    "model": {
+      "primary": "agy/gemini-flash-high-dev",
+      "fallbacks": [
+        "agy/gemini-flash-dev",
+        "agy/gemini-argon-high-dev",
+        "agy/claude-sonnet-dev",
+        "agy/gemini-argon-dev"
+      ]
+    }
+  },
+  "reviewer": {
+    "name": "reviewer",
+    "description": "Recenzent kodu (rola rev): bezstronny audyt diffu, architektury i bezpieczeństwa w trybie tylko do odczytu (read-only).",
+    "workspace": "${OPENCLAW_WORKSPACE}/agents/reviewer",
+    "agentDir": "${OPENCLAW_STATE}/agents/reviewer/agent",
+    "heartbeat": {
+      "every": "0m"
+    },
+    "model": {
+      "primary": "agy/gemini-flash-high-rev",
+      "fallbacks": [
+        "agy/gemini-flash-rev",
+        "agy/gemini-argon-high-rev",
+        "agy/claude-sonnet-rev",
+        "agy/gemini-argon-rev"
+      ]
+    }
+  },
+  "executor": {
+    "name": "executor",
+    "description": "Wykonawca wdrożenia (rola ops): bezpieczne wdrożenie na żywo po formalnej zgodzie człowieka (weryfikacja SHA, merge --ff-only, testy po merge, git push).",
+    "workspace": "${OPENCLAW_WORKSPACE}/agents/executor",
+    "agentDir": "${OPENCLAW_STATE}/agents/executor/agent",
+    "heartbeat": {
+      "every": "0m"
+    },
+    "model": {
+      "primary": "agy/gemini-flash-high-ops",
+      "fallbacks": [
+        "agy/gemini-flash-ops",
+        "cc/claude-sonnet-ops",
+        "agy/claude-sonnet-ops",
+        "agy/gemini-pro-ops"
+      ]
+    }
+  }
+}

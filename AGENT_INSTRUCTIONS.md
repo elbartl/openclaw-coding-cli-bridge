@@ -166,7 +166,55 @@ loginctl enable-linger "$USER" 2>/dev/null || true
 
 ---
 
-## 5. Step 4: Verification & Smoke Testing
+## 5. Step 4: Wire Built-in MCP Servers into OpenClaw
+
+This repository bundles two critical, zero-dependency MCP servers designed for autonomous development workflows:
+1. **`tools/cases/cases_mcp.js` (Cases DEV Ticketing & State Machine):** Governs software task progression across 8 states (`plan` → `coding` → `testing` → `review` → `awaiting_approval` → `approved` → `deployed`) with mandatory Human-in-the-Loop gates.
+2. **`tools/webread/server.js` (WebRead MCP):** Secure web documentation reader with full SSRF protection (IP pinning, RFC validation), HTML/CSS noise reduction, zero-width character stripping, and prompt injection detection.
+
+### Register in `openclaw.json` under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "cases": {
+      "command": "node",
+      "args": ["tools/cases/cases_mcp.js"],
+      "cwd": "/path/to/openclaw-coding-cli-bridge",
+      "env": {
+        "CASES_DEV_DIR": "~/.openclaw/state/cases/dev",
+        "CASES_OWNER_NAME": "owner"
+      }
+    },
+    "webread": {
+      "command": "node",
+      "args": ["tools/webread/server.js"],
+      "cwd": "/path/to/openclaw-coding-cli-bridge",
+      "env": {
+        "CLEF_BUDGET_FILE": "~/.openclaw/state/webread/budget.json"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 6. Step 5: Deploy the Multiagent Coding Team
+
+This repository includes a battle-tested multiagent team architecture located in `templates/agents/`:
+- **`master` (`-ops`):** Architectural coordinator, breaks goals into tasks, reviews diffs, requests human approvals.
+- **`developer` (`-dev`):** Writes code and unit tests inside an isolated sandbox (`git worktree` + `bwrap`, no-net).
+- **`tester` (`-dev`):** Adversarial tester who writes independent edge-case tests; author of code is never sole author of tests.
+- **`reviewer` (`-rev`):** Strict read-only auditor verifying diffs, contract compliance, and absence of security regressions.
+- **`executor` (`-ops`):** Precise deployment agent verifying the human-approved commit SHA co-incidentally, merging fast-forward (`--ff-only`), and running post-merge smoke tests.
+
+### Inject Agent Entries:
+Inspect `templates/agents/openclaw_agents_snippet.json` and merge the entries into `agents.entries` in your `~/.openclaw/openclaw.json`. Copy the agent persona files (`SOUL.md` and `AGENTS.md`) into your workspace agent directories as needed.
+
+---
+
+## 7. Step 6: Verification & Smoke Testing
 
 Execute health and smoke tests before concluding:
 
@@ -183,11 +231,15 @@ curl -fsS http://127.0.0.1:8001/v1/models | grep -q "claude-sonnet" && echo "Cla
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gemini-flash-ro","messages":[{"role":"user","content":"ping"}]}' | grep -q "choices" && echo "AGY Smoke Test: OK" || true
+
+# 4. Verify Built-in Tool Test Suites
+(cd tools/cases && node test_cases_dev.js && node test_cases_mcp.js)
+(cd tools/webread && node ssrf.test.js && node extract.test.js && node scan.test.js && node server.test.js)
 ```
 
 ---
 
-## 6. Security Architecture & Full Privileges
+## 8. Security Architecture & Full Privileges
 
 - **Read-Only (`-ro`):** Suitable for background monitors, periodic checks, and reporting. Read tools only.
 - **Operations (`-ops`):** Interactive assistant default. Allows reading, tools, and execution, but denies destructive system and infrastructure configuration changes.

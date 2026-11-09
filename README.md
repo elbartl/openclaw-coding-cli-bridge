@@ -361,6 +361,62 @@ Two gotchas that cost real debugging time:
 
 MIT — see [LICENSE](LICENSE).
 
+## Autonomous Multiagent Team & Ecosystem
+
+This repository provides everything needed to turn OpenClaw into an autonomous, safe software development organization:
+
+```
+                  ┌───────────────────────────────┐
+                  │   Human Operator / Decider    │
+                  └───────────────┬───────────────┘
+                                  │ (Human-in-the-Loop Approval)
+                                  ▼
+                  ┌───────────────────────────────┐
+                  │    Master / Coordinator       │
+                  │  (Deconstructs goals & specs) │
+                  └───────┬───────────────┬───────┘
+                          │               │
+        ┌─────────────────▼───┐       ┌───▼─────────────────┐
+        │  Developer Agent    │       │   Adversarial Tester│
+        │(Worktree + Sandbox) │◀─────▶│ (Independent Tests) │
+        └─────────────────┬───┘       └───┬─────────────────┘
+                          │               │
+                          └───────┬───────┘
+                                  ▼
+                      ┌───────────────────────┐
+                      │    Reviewer Agent     │
+                      │ (Read-only Diff Audit)│
+                      └───────────┬───────────┘
+                                  ▼
+                      ┌───────────────────────┐
+                      │    Executor Agent     │
+                      │(ff-only merge & deploy│
+                      └───────────────────────┘
+```
+
+### 1. Multiagent Team Templates (`templates/agents/`)
+- **`master` (`-ops`):** Architectural coordinator who translates requirements into formal contracts and manages the lifecycle.
+- **`developer` (`-dev`):** Operates strictly in an isolated sandbox (`git worktree` + `bwrap`, network disabled).
+- **`tester` (`-dev`):** Independent adversarial tester — *the author of the code is never the sole author of its tests*.
+- **`reviewer` (`-rev`):** Read-only security and architecture auditor inspecting diffs against acceptance criteria.
+- **`executor` (`-ops`):** Precise deployment agent that verifies clean worktrees, matches human-approved commit SHAs co-incidentally, and executes fast-forward only merges (`git merge --ff-only`).
+- Includes ready-to-paste `openclaw_agents_snippet.json`.
+
+### 2. Software Ticketing & Governance (`tools/cases/`)
+Zero-dependency Node.js state machine and stdio MCP server for governing development tasks:
+- **8-Stage Lifecycle:** `new` → `plan` → `coding` → `testing` → `review` → `awaiting_approval` → `approved` → `deployed`.
+- **Atomic File Store:** Safe concurrent access via directory locking (`.lock`), atomic renames, and stale PID detection.
+- **Hard Gate on Human Approval:** Agents cannot bypass the approval gate; invalidating code or CLEF scans resets approval to `stale`.
+- **MCP Server:** Exposes 11 tools (`case_create`, `case_get`, `case_list`, `case_stage`, `case_assign`, `case_report`, `case_set_sha`, `case_scan`, `case_diff`, `case_request_approval`, `case_summary`).
+
+### 3. Safe Web Page Reader MCP (`tools/webread/`)
+Zero-dependency stdio MCP server that allows agents to securely read web documentation:
+- **SSRF Defense-in-Depth:** Full RFC coverage for private/loopback/CGNAT/ULA addresses (IPv4 & IPv6), DNS rebinding prevention via IP pinning at TCP socket level, redirect hop validation.
+- **Content Hygiene:** Strips hidden elements (`display: none`, `visibility: hidden`, `opacity: 0`, matching background/foreground colors), zero-width characters, bidi-controls, and Unicode Tag Characters.
+- **Prompt Injection Defense:** Chunked scanning with overlap against Cloudflare CLEF, HMAC cryptographic stamping, and automatic quarantine of malicious payloads.
+
+---
+
 ## Also in this repo
 
 | Path | What it is |
@@ -368,4 +424,7 @@ MIT — see [LICENSE](LICENSE).
 | `claude_proxy.js` | Claude Code backend ([above](#claude-code-backend-claude_proxyjs)). |
 | `model_resolver.js` | Keeps `agy` model ids valid when the vendor renames models. |
 | `plugins/clef-decision/` | OpenClaw decision-model provider on Cloudflare CLEF ([above](#clef)). |
-| `tools/` | Modules the proxies load at runtime — `clef_guard`, `pools_state`, `quota_error`, `cc_usage`, `agy_stream`, `paperclip_wake` — plus tests: `for t in tools/test_*.js; do node $t; done`. |
+| `templates/agents/` | Multiagent coding team templates and `openclaw.json` snippets. |
+| `tools/cases/` | Ticketing system and state machine MCP server (`cases_dev.js`, `cases_mcp.js`). |
+| `tools/webread/` | Safe web page reader MCP server with SSRF protection and prompt injection detector. |
+| `tools/` | Modules the proxies load at runtime — `clef_guard`, `pools_state`, `quota_error`, `cc_usage`, `agy_stream`, `paperclip_wake`. |
