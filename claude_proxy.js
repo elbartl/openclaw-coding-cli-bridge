@@ -407,7 +407,23 @@ function roleArgs(role, project, devCtx) {
     if (role === 'cfg') args.push('--disallowedTools', loadCfgDeny().join(','));
     return args;
 }
-const DEFAULT_ROLE = (process.env.CC_DEFAULT_ROLE === 'ro') ? 'ro' : 'full';
+const DEFAULT_ROLE = (process.env.CC_DEFAULT_ROLE === 'full') ? 'full' : 'ro';
+// --- full-role grant ---
+// Bez sufiksu = rola 'ro'. Rola 'full' tylko przez sufiks -full i ważny grant
+// w /etc/openclaw/full-grant (epoch wygaśnięcia; właściciel root lub użytkownik
+// proxy; bez zapisu dla grupy/innych). Modele nie mają zapisu w /etc.
+const FULL_GRANT_FILE = process.env.OC_FULL_GRANT_FILE || '/etc/openclaw/full-grant';
+function fullGrantValid() {
+    try {
+        const st = fs.statSync(FULL_GRANT_FILE);
+        if (!st.isFile()) return false;
+        if (st.uid !== 0 && st.uid !== process.getuid()) return false;
+        if (st.mode & 0o022) return false;
+        const exp = parseInt(fs.readFileSync(FULL_GRANT_FILE, 'utf8').trim(), 10);
+        return Number.isFinite(exp) && exp > Math.floor(Date.now() / 1000);
+    } catch (e) { return false; }
+}
+const FULL_DENIED = 'Rola -full wymaga ważnego grantu (/etc/openclaw/full-grant). Użyj sufiksu -ops albo poproś administratora o grant.';
 const roleActive = { full: 0, ops: 0, ro: 0, cfg: 0, web: 0, dev: 0 };
 
 // Model id grammar: <model>[:<project>][-ro|-ops|-cfg|-web|-dev]
@@ -423,6 +439,7 @@ function resolveModel(requested) {
     let id = requested.includes('/') ? requested.split('/').pop() : requested;
     let role = DEFAULT_ROLE;
     if (id.endsWith('-ro')) { role = 'ro'; id = id.slice(0, -3); }
+    else if (id.endsWith('-full')) { role = 'full'; id = id.slice(0, -5); }
     else if (id.endsWith('-ops')) { role = 'ops'; id = id.slice(0, -4); }
     else if (id.endsWith('-cfg')) { role = 'cfg'; id = id.slice(0, -4); }
     else if (id.endsWith('-web')) { role = 'web'; id = id.slice(0, -4); }
@@ -794,7 +811,7 @@ const server = http.createServer((req, res) => {
         res.setHeader('Content-Type', 'application/json');
         const baseIds = Object.keys(MODEL_MAP);
         const withProjects = [...baseIds, ...Object.keys(loadProjects()).flatMap(p => baseIds.map(id => `${id}:${p}`))];
-        const ids = [...withProjects, ...["ro", "ops", "cfg", "web", "dev"].flatMap(r => withProjects.map(id => `${id}-${r}`))];
+        const ids = [...withProjects, ...["ro", "full", "ops", "cfg", "web", "dev"].flatMap(r => withProjects.map(id => `${id}-${r}`))];
         res.end(JSON.stringify({ object: 'list', data: ids.map(id => ({ id, object: 'model', owned_by: 'claude-code' })) }));
         return;
     }
@@ -856,6 +873,25 @@ const server = http.createServer((req, res) => {
 
         const { model, effort, project, projectName } = resolved;
         const role = resolved.role;
+        if (role === 'full' && !fullGrantValid()) {
+            console.error(`✗ ${FULL_DENIED}`);
+            if (isStream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                res.write(`data: ${JSON.stringify({
+                    id: requestId,
+                    object: 'chat.completion.chunk',
+                    created: createdTime,
+                    model: modelName,
+                    choices: [{ delta: { content: `🛑 ${FULL_DENIED}` }, index: 0, finish_reason: 'stop' }],
+                })}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+                return;
+            }
+            return jsonError(403, FULL_DENIED, 'full_grant_required');
+        }
         const built = buildPrompt(messages);
         const system = built.system;
         const pc = applyPaperclipWake(built.prompt);

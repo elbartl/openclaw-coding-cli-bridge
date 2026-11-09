@@ -14,6 +14,9 @@ Both speak the same client contract, share the same **permission-role** model
 so a gateway can fail over between them. A third piece, `plugins/clef-decision/`, is an
 OpenClaw *decision-model* provider backed by Cloudflare Workers AI (see [CLEF](#clef)).
 
+> 🤖 **Automated Setup by OpenClaw Agents:**
+> If you are having your OpenClaw agent install and wire this bridge automatically, point it to [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md). It contains step-by-step pre-flight checks, systemd user service templates, `openclaw.json` configuration, and smoke tests.
+
 The rest of this document starts with the `agy` proxy (the original, most documented
 part), then covers Claude Code, roles and CLEF.
 
@@ -108,7 +111,7 @@ profile cannot be built or verified, the request is refused, never run unfiltere
 
 | Role | Intended for | What it can do | How it is enforced |
 |---|---|---|---|
-| `full` | trusted automation with a human-reviewed prompt | everything: shell, all MCP servers | `agy --dangerously-skip-permissions` / `claude --dangerously-skip-permissions` |
+| `full` | explicitly authorized maintenance with a human-reviewed prompt | everything: shell, all MCP servers | `agy --dangerously-skip-permissions` / `claude --dangerously-skip-permissions`. Strictly guarded: requires a valid time-bound grant file (`/etc/openclaw/full-grant`, containing a future epoch timestamp, root/proxy ownership, non-writable by group/others). Without a valid grant, proxy returns `403 Forbidden` |
 | `ro` | read-only analysis, watchdogs, reporting | read tools and an explicit allowlist of read-only MCP tools | `agy`: isolated `HOME` with a narrow `permissions.allow` and no skip-permissions (a tool not on the list is auto-denied, no hang). `claude`: `--permission-mode dontAsk` + `--tools` narrowed to `Read,Glob,Grep,WebSearch,WebFetch` + allowlist file + a deny list for secrets (`.env`, `*.pem`, `.ssh`, …) |
 | `ops` | the interactive "main" agent: may drive devices and run commands, but must not rewrite configuration | `full` minus a deny list of configuration-changing MCP tools | `--disallowedTools` from `ops-deny.json` (Claude Code); for `agy` an isolated `HOME` built by `tools/build-ops-profile.sh` with the tools both hidden (`disabledTools`) and denied (`permissions.deny`), plus an argument guard hook. A missing/broken deny file falls back to a built-in default list, never to an empty one |
 | `cfg` | the *configuration writer* agent | like `ops`, but configuration changes are **allowed**; only the tools in `cfg-deny.json` (e.g. restart) are removed | same mechanism as `ops`, own deny file and own `agy` profile |

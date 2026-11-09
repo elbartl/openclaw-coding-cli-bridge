@@ -23,3 +23,15 @@ PLAN_ACL_LIMITS.md
 
 # home-lab work order (private paths, cron ids) — like PROXY.md
 ZLECENIE_PERMISSION_ERRORS.md
+
+# local copies made before risky edits (may hold private paths/config dumps)
+backups/
+*.bak-*
+
+# binary / office documents (keep out of git / diff engines)
+*.docx
+*.pdf
+*.odt
+*.xlsx
+*.doc
+*.xls

@@ -636,7 +636,23 @@ function buildDevPromptNote(devCtx) {
         '- Natywne narzędzie `run_command` oraz dostęp do internetu są wyłączone. Wszystkie polecenia, testy, lintery oraz operacje Git uruchamiaj wyłącznie przez serwer MCP `dev-sandbox`: `dev_info`, `dev_exec`, `dev_git_status`, `dev_git_diff`, `dev_git_commit`.',
     ].join('\n');
 }
-const DEFAULT_ROLE = (process.env.AGY_DEFAULT_ROLE === 'ro') ? 'ro' : 'full'; // backward compatible
+const DEFAULT_ROLE = (process.env.AGY_DEFAULT_ROLE === 'full') ? 'full' : 'ro';
+// --- full-role grant ---
+// Bez sufiksu = rola 'ro'. Rola 'full' tylko przez sufiks -full i ważny grant
+// w /etc/openclaw/full-grant (epoch wygaśnięcia; właściciel root lub użytkownik
+// proxy; bez zapisu dla grupy/innych). Modele nie mają zapisu w /etc.
+const FULL_GRANT_FILE = process.env.OC_FULL_GRANT_FILE || '/etc/openclaw/full-grant';
+function fullGrantValid() {
+    try {
+        const st = fs.statSync(FULL_GRANT_FILE);
+        if (!st.isFile()) return false;
+        if (st.uid !== 0 && st.uid !== process.getuid()) return false;
+        if (st.mode & 0o022) return false;
+        const exp = parseInt(fs.readFileSync(FULL_GRANT_FILE, 'utf8').trim(), 10);
+        return Number.isFinite(exp) && exp > Math.floor(Date.now() / 1000);
+    } catch (e) { return false; }
+}
+const FULL_DENIED = 'Rola -full wymaga ważnego grantu (/etc/openclaw/full-grant). Użyj sufiksu -ops albo poproś administratora o grant.';
 // Live per-role slot occupancy, surfaced by /healthz.
 const roleActive = { full: 0, ro: 0, ops: 0, cfg: 0, web: 0, dev: 0 };
 // Pool usage state for OpenClaw/Paperclip (DOM-30). Writes only while
@@ -655,6 +671,7 @@ function resolveAgyModel(requested) {
     let id = requested.includes('/') ? requested.split('/').pop() : requested;
     let role = DEFAULT_ROLE;
     if (id.endsWith('-ro')) { role = 'ro'; id = id.slice(0, -3); }
+    else if (id.endsWith('-full')) { role = 'full'; id = id.slice(0, -5); }
     else if (id.endsWith('-ops')) { role = 'ops'; id = id.slice(0, -4); }
     else if (id.endsWith('-cfg')) { role = 'cfg'; id = id.slice(0, -4); }
     else if (id.endsWith('-web')) { role = 'web'; id = id.slice(0, -4); }
@@ -1134,7 +1151,7 @@ const server = http.createServer((req, res) => {
         // `-ro` = read-only, `-ops` = full minus HA config writes,
         // `-cfg` = full minus cfg-deny.json (ha_restart).
         // Register the ones you want selectable in openclaw.json.
-        const ids = [...baseIds, ...['ro', 'ops', 'cfg', 'web', 'dev'].flatMap(r => baseIds.map(id => `${id}-${r}`))];
+        const ids = [...baseIds, ...['ro', 'full', 'ops', 'cfg', 'web', 'dev'].flatMap(r => baseIds.map(id => `${id}-${r}`))];
         res.end(JSON.stringify({
             object: "list",
             data: ids.map(id => ({ id, object: "model", owned_by: "local" }))
@@ -1230,6 +1247,28 @@ const server = http.createServer((req, res) => {
             }
             let agyModel = resolved.model;   // re-resolved once if agy rejects the name (see retryAfterUnknownModel)
             const role = resolved.role || DEFAULT_ROLE;
+            if (role === 'full' && !fullGrantValid()) {
+                console.error(`✗ ${FULL_DENIED}`);
+                if (isStream) {
+                    res.setHeader('Content-Type', 'text/event-stream');
+                    res.setHeader('Cache-Control', 'no-cache');
+                    res.setHeader('Connection', 'keep-alive');
+                    res.write(`data: ${JSON.stringify({
+                        id: `chatcmpl-${Date.now()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: modelName,
+                        choices: [{ delta: { content: `🛑 ${FULL_DENIED}` }, index: 0, finish_reason: 'stop' }]
+                    })}\n\n`);
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                } else {
+                    res.statusCode = 403;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: FULL_DENIED, type: 'permission_denied', code: 'full_grant_required' } }));
+                }
+                return;
+            }
             const roleCfg = ROLES[role] || ROLES.full;
             if (role === 'ops' || role === 'cfg' || role === 'web') {
                 const opsErr = role === 'web' ? ensureWebProfile() : ensureDenyProfile(role);
